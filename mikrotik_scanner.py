@@ -484,10 +484,10 @@ class ScannerApp:
             try:
                 if cfg["cmdtype"] == "SSH":
                     from ssh_client import run_ssh_command
-                    out = run_ssh_command(
-                        dev.reach_ip, cfg["user"], cfg["password"], command,
+                    out = self._ssh_try_addresses(dev, cfg, lambda host: run_ssh_command(
+                        host, cfg["user"], cfg["password"], command,
                         port=cfg["ssh_port"], timeout=cfg["timeout"],
-                    )
+                    ))
                 else:
                     out = self._run_api_commands(dev, command, cfg)
                 self.log(f"--- {dev.ip} ({dev.identity}) via {self._via(dev, cfg)} ---\n{out}")
@@ -567,12 +567,28 @@ class ScannerApp:
                          f"{type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Backup error: {exc}")))
 
+    def _ssh_try_addresses(self, dev: Device, cfg: dict, action):
+        """Run action(host) over SSH on the scanned address, then on the
+        bridge1 address if the first one's SSH port does not answer at all
+        (SSH is often allowed only on the management/bridge network)."""
+        from ssh_client import SSHStageError
+        hosts = [dev.reach_ip] + ([dev.ip] if dev.ip and dev.ip != dev.reach_ip else [])
+        for i, host in enumerate(hosts):
+            try:
+                return action(host)
+            except SSHStageError as exc:
+                unreachable = "did not answer" in str(exc) or "refused" in str(exc)
+                if unreachable and i + 1 < len(hosts):
+                    self.log(f"{dev.ip}: {exc}; trying bridge1 address {hosts[i + 1]}")
+                    continue
+                raise
+
     def _ssh_export(self, dev: Device, cfg: dict) -> str:
         from ssh_client import export_config
-        return export_config(
-            dev.reach_ip, cfg["user"], cfg["password"],
+        return self._ssh_try_addresses(dev, cfg, lambda host: export_config(
+            host, cfg["user"], cfg["password"],
             port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0),
-        )
+        ))
 
     # ---------------------------------------------------------- import/exp
     def on_export(self) -> None:
