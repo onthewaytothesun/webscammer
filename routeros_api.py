@@ -231,27 +231,31 @@ class RouterOSApi:
 
     # -- login ------------------------------------------------------------
     def login(self) -> None:
-        # RouterOS 6.43+ accepts plaintext login in a single sentence.
+        # RouterOS 6.43+ authenticates from a single /login with name+password
+        # and replies !done with no =ret=. Pre-6.43 routers instead reply with
+        # a challenge in =ret=; sending name+password there does NOT log you in,
+        # it just hands back the challenge. Treating that !done as success left
+        # the session UNAUTHENTICATED, so the next command was dropped by the
+        # router (SSLEOFError right after "login"). So: only treat a !done
+        # WITHOUT a challenge as success; otherwise do the MD5 response step.
         try:
-            self.talk(["/login", "=name=" + self.username, "=password=" + self.password])
-            self._log("debug", "%s login ok (plaintext)", self.host)
-            return
+            replies = self.talk(
+                ["/login", "=name=" + self.username, "=password=" + self.password]
+            )
         except RouterOSError as exc:
-            self._log("debug", "%s plaintext login failed (%s), trying legacy", self.host, exc)
-        # Legacy challenge/response login (pre-6.43).
-        self._write_sentence(["/login"])
+            self._log("debug", "%s modern login rejected (%s), trying challenge", self.host, exc)
+            replies = self.talk(["/login"])
+
         challenge_hex = ""
-        while True:
-            sentence = self._read_sentence()
-            if not sentence:
-                continue
-            for w in sentence:
-                if w.startswith("=ret="):
-                    challenge_hex = w[5:]
-            if sentence[0] == "!done":
-                break
-            if sentence[0] in ("!trap", "!fatal"):
-                raise RouterOSError("login failed (check username/password)")
+        for row in replies:
+            if row.get("ret"):
+                challenge_hex = row["ret"]
+
+        if not challenge_hex:
+            self._log("debug", "%s login ok (plaintext)", self.host)
+            return  # modern login already authenticated
+
+        # Legacy challenge/response (pre-6.43).
         challenge = binascii.unhexlify(challenge_hex)
         md = hashlib.md5()
         md.update(b"\x00")
@@ -260,6 +264,6 @@ class RouterOSApi:
         response = "00" + md.hexdigest()
         try:
             self.talk(["/login", "=name=" + self.username, "=response=" + response])
-            self._log("debug", "%s login ok (legacy)", self.host)
+            self._log("debug", "%s login ok (legacy challenge)", self.host)
         except RouterOSError:
             raise RouterOSError("login failed (check username/password)")
