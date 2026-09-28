@@ -384,6 +384,52 @@ def _backoff(logger, ip: str, attempt: int, exc: Exception) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SSH scan (alternative transport that avoids api-ssl TLS entirely)
+# ---------------------------------------------------------------------------
+# Each line prints one labelled value, so the output needs no table parsing.
+# routerboard/license are guarded because CHR/x86 have no routerboard.
+SSH_SCAN_SCRIPT = "\n".join([
+    ':put ("IDENTITY=" . [:tostr [/system identity get name]])',
+    ':put ("BOARD=" . [:tostr [/system resource get board-name]])',
+    ':put ("VERSION=" . [:tostr [/system resource get version]])',
+    ':do { :put ("SERIAL=" . [:tostr [/system routerboard get serial-number]]) } on-error={}',
+    ':do { :put ("MODEL=" . [:tostr [/system routerboard get model]]) } on-error={}',
+    ':do { :put ("LICENSE=" . [:tostr [/system license get nlevel]]) } on-error={}',
+    ':foreach i in=[/ip address find where interface="bridge1"] '
+    'do={ :put ("BRIDGE=" . [:tostr [/ip address get $i address]]) }',
+])
+
+
+def parse_ssh_scan(text: str, ip: str) -> Device:
+    """Parse the labelled output of SSH_SCAN_SCRIPT into a Device."""
+    dev = Device(ip=ip)
+    addrs: List[Dict[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key == "IDENTITY":
+            dev.identity = val
+        elif key == "BOARD":
+            dev.board_name = val or dev.board_name
+        elif key == "VERSION":
+            dev.routeros = val
+        elif key == "SERIAL":
+            dev.key = val or dev.key
+        elif key == "MODEL" and not dev.board_name:
+            dev.board_name = val
+        elif key == "LICENSE":
+            dev.license = val
+        elif key == "BRIDGE" and val:
+            addrs.append({"address": val, "interface": BRIDGE_INTERFACE})
+    dev.addresses = addrs
+    dev.status = "OK (SSH)"
+    return dev
+
+
+# ---------------------------------------------------------------------------
 # Backups
 # ---------------------------------------------------------------------------
 def sanitize(name: str) -> str:

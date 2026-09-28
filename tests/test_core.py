@@ -13,6 +13,7 @@ from core import (  # noqa: E402
     dedupe_devices,
     expand_targets,
     parse_cli_to_api,
+    parse_ssh_scan,
     _is_auth_failure,
 )
 from routeros_api import RouterOSApi, RouterOSError  # noqa: E402
@@ -99,6 +100,33 @@ def test_length_encoding_roundtrip_boundaries():
     for value in (0x00, 0x7F, 0x80, 0x3FFF, 0x4000, 0x1FFFFF, 0x200000):
         encoded = RouterOSApi.encode_length(value)
         assert isinstance(encoded, bytes) and len(encoded) >= 1
+
+
+def test_parse_ssh_scan():
+    out = (
+        "IDENTITY=V_Svobodi_65\n"
+        "BOARD=RB4011iGS+\n"
+        "VERSION=7.14.3 (stable)\n"
+        "SERIAL=HFX0ABC\n"
+        "MODEL=RB4011iGS+\n"
+        "LICENSE=5\n"
+        "BRIDGE=192.168.88.1/24\n"
+        "BRIDGE=192.168.99.1/24\n"
+    )
+    dev = parse_ssh_scan(out, "10.0.0.5")
+    assert dev.identity == "V_Svobodi_65"
+    assert dev.board_name == "RB4011iGS+"
+    assert dev.routeros == "7.14.3 (stable)"
+    assert dev.key == "HFX0ABC"
+    assert dev.license == "5"
+    assert dev.status == "OK (SSH)"
+    assert bridge_ip(dev.addresses) == "192.168.88.1"
+
+
+def test_parse_ssh_scan_falls_back_to_model_when_no_board():
+    out = "IDENTITY=CHR1\nBOARD=\nVERSION=7.14\nMODEL=CHR\n"
+    dev = parse_ssh_scan(out, "10.0.0.6")
+    assert dev.board_name == "CHR"
 
 
 def test_auth_failure_detection():

@@ -77,6 +77,7 @@ class ScannerApp:
         self.var_threads = StringVar(value="30")
         self.var_timeout = StringVar(value="10")
         self.var_retries = StringVar(value="2")
+        self.var_scanvia = StringVar(value="API-SSL")
         self.var_cmdtype = StringVar(value="API/SSL")
         self.var_save = BooleanVar(value=False)
         self.var_find = StringVar()
@@ -105,6 +106,11 @@ class ScannerApp:
         field(form, "Threads:", self.var_threads, 5)
         field(form, "Timeout:", self.var_timeout, 4)
         field(form, "Retries:", self.var_retries, 3)
+        ttk.Label(form, text="Scan via:").pack(side=LEFT, padx=(6, 2))
+        ttk.Combobox(
+            form, textvariable=self.var_scanvia, values=["API-SSL", "SSH"],
+            width=8, state="readonly",
+        ).pack(side=LEFT)
         ttk.Label(form, text="Command Type:").pack(side=LEFT, padx=(6, 2))
         ttk.Combobox(
             form,
@@ -322,6 +328,7 @@ class ScannerApp:
             "threads": threads,
             "timeout": timeout,
             "retries": retries,
+            "scanvia": self.var_scanvia.get(),
             "cmdtype": self.var_cmdtype.get(),
         }
 
@@ -361,10 +368,15 @@ class ScannerApp:
         cfg = self._read_config()
         self.btn_pause.configure(state="normal", text="Pause")
         self.btn_stop.configure(state="normal")
-        self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
-                 f"timeout {cfg['timeout']}s, {cfg['retries']} retries, "
-                 f"API-SSL port {cfg['api_ssl_port']} (plain-API fallback only if 8729 refused). "
-                 f"Note: Command Type is used only by SEND, not by the scan.")
+        if cfg["scanvia"] == "SSH":
+            self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
+                     f"timeout {cfg['timeout']}s, via SSH port {cfg['ssh_port']}. "
+                     f"Note: Command Type is used only by SEND, not by the scan.")
+        else:
+            self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
+                     f"timeout {cfg['timeout']}s, {cfg['retries']} retries, "
+                     f"API-SSL port {cfg['api_ssl_port']} (plain-API fallback only if 8729 refused). "
+                     f"Note: Command Type is used only by SEND, not by the scan.")
         self.worker = threading.Thread(
             target=self._scan_worker, args=(targets, cfg), daemon=True
         )
@@ -383,12 +395,19 @@ class ScannerApp:
             if self.stop_event.is_set():
                 return None
             try:
-                dev = core.scan_host(
-                    ip, cfg["user"], cfg["password"],
-                    cfg["api_ssl_port"], plain_port=8728,
-                    timeout=cfg["timeout"], retries=cfg["retries"],
-                    logger=self.logger,
-                )
+                if cfg["scanvia"] == "SSH":
+                    from ssh_client import ssh_scan_host
+                    dev = ssh_scan_host(
+                        ip, cfg["user"], cfg["password"],
+                        port=cfg["ssh_port"], timeout=cfg["timeout"], logger=self.logger,
+                    )
+                else:
+                    dev = core.scan_host(
+                        ip, cfg["user"], cfg["password"],
+                        cfg["api_ssl_port"], plain_port=8728,
+                        timeout=cfg["timeout"], retries=cfg["retries"],
+                        logger=self.logger,
+                    )
                 dev.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.log(f"{ip}: found {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
@@ -587,6 +606,7 @@ class ScannerApp:
             "threads": self.var_threads.get(),
             "timeout": self.var_timeout.get(),
             "retries": self.var_retries.get(),
+            "scanvia": self.var_scanvia.get(),
             "cmdtype": self.var_cmdtype.get(),
             "command": self.txt_command.get("1.0", END).rstrip(),
             "save": True,
@@ -615,6 +635,7 @@ class ScannerApp:
         self.var_threads.set(data.get("threads", "30"))
         self.var_timeout.set(data.get("timeout", "10"))
         self.var_retries.set(data.get("retries", "2"))
+        self.var_scanvia.set(data.get("scanvia", "API-SSL"))
         self.var_cmdtype.set(data.get("cmdtype", "API/SSL"))
         self.var_save.set(data.get("save", False))
         if data.get("password"):
