@@ -36,6 +36,7 @@ from tkinter import (
     filedialog,
     messagebox,
 )
+from tkinter import font as tkfont
 from tkinter import ttk
 
 import core
@@ -95,8 +96,11 @@ class ScannerApp:
     def _build_ui(self) -> None:
         # bigger table rows so the check / update glyphs are easy to hit
         style = ttk.Style(self.root)
-        style.configure("Treeview", font=("TkDefaultFont", 11), rowheight=28)
-        style.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
+        base = tkfont.nametofont("TkDefaultFont")
+        self._tree_font = base.copy()  # keep a reference or Tk drops it
+        self._tree_font.configure(size=abs(base.cget("size")) + 2)
+        style.configure("Treeview", font=self._tree_font,
+                        rowheight=int(self._tree_font.metrics("linespace") * 1.8))
         # copy/paste for entries and log, independent of keyboard layout
         self._install_clipboard_bindings()
 
@@ -185,7 +189,10 @@ class ScannerApp:
         # bottom bar
         bottom = ttk.Frame(self.root, padding=6)
         bottom.pack(fill=X)
-        ttk.Entry(bottom, textvariable=self.var_find, width=30).pack(side=LEFT)
+        find_entry = ttk.Entry(bottom, textvariable=self.var_find, width=30)
+        find_entry.pack(side=LEFT)
+        self._attach_context_menu(find_entry)
+        find_entry.bind("<Return>", lambda e: self.on_find())
         ttk.Button(bottom, text="Find", command=self.on_find).pack(side=LEFT, padx=4)
         ttk.Button(bottom, text="Save Log", command=self.on_save_log).pack(side=LEFT, padx=8)
         ttk.Label(bottom, text=f"Log: logs/{os.path.basename(self.log_path)}",
@@ -194,21 +201,31 @@ class ScannerApp:
         ttk.Button(bottom, text="Import", command=self.on_import).pack(side=RIGHT, padx=2)
 
     # ---------------------------------------------------- clipboard helpers
+    # Physical key codes of C / V / X / A. Tk binds only the Latin keysyms, so on
+    # a Cyrillic layout Ctrl+С etc. do nothing unless we dispatch by key code.
+    # The codes differ per windowing system (Windows VK codes vs X11 keycodes).
+    _CLIP_CODES = {
+        "win32": {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>", 65: "all"},
+        "x11": {54: "<<Copy>>", 55: "<<Paste>>", 53: "<<Cut>>", 38: "all"},
+    }
+
     def _install_clipboard_bindings(self) -> None:
-        """Ctrl+C/V/X/A by physical key code, so copy/paste also works on a
-        Cyrillic (or any non-Latin) keyboard layout, where Ctrl+С etc. produce
-        a different keysym and the default bindings don't fire."""
-        win = {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>", 65: "all"}
-        x11 = {54: "<<Copy>>", 55: "<<Paste>>", 53: "<<Cut>>", 38: "all"}
+        self._clip_codes = self._CLIP_CODES.get(self.root.tk.call("tk", "windowingsystem"), {})
+        if not self._clip_codes:
+            return  # macOS: Tk already maps Command+C/V/X/A for the active layout
 
         def dispatch(event):
-            action = win.get(event.keycode) or x11.get(event.keycode)
+            action = self._clip_codes.get(event.keycode)
             if not action:
                 return None
             if action == "all":
                 self._select_all(event.widget)
-            else:
-                self._safe_event(event.widget, action)
+                return "break"
+            if (event.keysym or "").lower() in ("c", "v", "x"):
+                # Latin layout: Tk's own class binding has already done it, and
+                # doing it again would e.g. paste twice.
+                return None
+            self._safe_event(event.widget, action)
             return "break"
 
         self.root.bind_all("<Control-KeyPress>", dispatch)
@@ -250,18 +267,23 @@ class ScannerApp:
         widget.bind("<Button-3>", popup)
 
     def _make_readonly(self, text) -> None:
-        """Let the user select and copy from a Text but not edit it."""
-        allowed = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
-                   "Shift_L", "Shift_R", "Control_L", "Control_R"}
+        """Let the user select and copy from a Text but not change it."""
+        nav = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+               "Shift_L", "Shift_R", "Control_L", "Control_R"}
 
         def block(event):
-            if event.state & 0x4:  # Control held -> copy / select-all
+            if event.keysym in nav:
                 return None
-            if event.keysym in allowed:
-                return None
+            if event.state & 0x4:  # Ctrl held: only copy / select-all may pass
+                code = getattr(self, "_clip_codes", {}).get(event.keycode)
+                if event.keysym.lower() in ("c", "a", "insert") or code in ("<<Copy>>", "all"):
+                    return None
             return "break"
 
         text.bind("<Key>", block)
+        # paste / cut / middle-click paste come in as virtual events
+        for virtual in ("<<Paste>>", "<<Cut>>", "<<PasteSelection>>", "<<Clear>>"):
+            text.bind(virtual, lambda e: "break")
         self._attach_context_menu(text, readonly=True)
 
     # ------------------------------------------------------------- helpers
@@ -275,39 +297,49 @@ class ScannerApp:
 
     def _write_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
+        at_bottom = self.txt_output.yview()[1] >= 0.999  # follow the log only if already at the end
         self.txt_output.insert(END, f"[{stamp}] {message}\n")
-        self.txt_output.see(END)
+        if at_bottom:
+            self.txt_output.see(END)
 
     def _drain_queue(self) -> None:
         try:
             while True:
-                kind, payload = self.ui_queue.get_nowait()
-                if kind == "log":
-                    self._write_log(payload)
-                elif kind == "device":
-                    self._upsert_device(payload)
-                elif kind == "progress":
-                    done, total = payload
-                    self.progress["maximum"] = max(total, 1)
-                    self.progress["value"] = done
-                elif kind == "status":
-                    iid, text = payload
-                    if self.tree.exists(iid):
-                        self.tree.set(iid, "Status", text)
-                        self.devices[iid].status = text
-                elif kind == "status_ip":
-                    ip, text = payload
-                    for iid, dev in self.devices.items():
-                        if ip in (dev.ip, dev.reach_ip) and self.tree.exists(iid):
-                            dev.status = text
-                            self.tree.set(iid, "Status", text)
-                elif kind == "save_devices":
-                    self._save_devices()
-                elif kind == "done":
-                    self._scan_finished(payload)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._drain_queue)
+                try:
+                    kind, payload = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_ui_message(kind, payload)
+                except Exception:  # noqa: BLE001 - keep the UI loop alive
+                    self.logger.exception("UI message %r failed", kind)
+        finally:
+            self.root.after(100, self._drain_queue)
+
+    def _handle_ui_message(self, kind: str, payload) -> None:
+        if kind == "log":
+            self._write_log(payload)
+        elif kind == "device":
+            self._upsert_device(payload)
+        elif kind == "progress":
+            done, total = payload
+            self.progress["maximum"] = max(total, 1)
+            self.progress["value"] = done
+        elif kind == "status":
+            iid, text = payload
+            if self.tree.exists(iid):
+                self.tree.set(iid, "Status", text)
+                self.devices[iid].status = text
+        elif kind == "status_ip":
+            ip, text = payload
+            for iid, dev in self.devices.items():
+                if ip in (dev.ip, dev.reach_ip) and self.tree.exists(iid):
+                    dev.status = text
+                    self.tree.set(iid, "Status", text)
+        elif kind == "save_devices":
+            self._save_devices()
+        elif kind == "done":
+            self._scan_finished(payload)
 
     def _upsert_device(self, dev: Device) -> None:
         iid = dev.key or dev.ip
@@ -748,12 +780,10 @@ class ScannerApp:
         if not path:
             return
         with open(path, newline="", encoding="utf-8-sig") as fh:
-            sample = fh.read(2048)
+            header = fh.readline()
             fh.seek(0)
-            try:
-                delim = csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
-            except csv.Error:
-                delim = CSV_DELIMITER
+            counts = {d: header.count(d) for d in (";", ",", "\t")}
+            delim = max(counts, key=counts.get) if any(counts.values()) else CSV_DELIMITER
             reader = csv.DictReader(fh, delimiter=delim)
             count = 0
             for row in reader:
@@ -777,8 +807,10 @@ class ScannerApp:
     def _save_devices(self) -> None:
         try:
             rows = [dataclasses.asdict(d) for d in self.devices.values()]
-            with open(DEVICES_FILE, "w", encoding="utf-8") as fh:
+            tmp = DEVICES_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(rows, fh, indent=1)
+            os.replace(tmp, DEVICES_FILE)  # a crash mid-write must not destroy the cache
         except (OSError, TypeError) as exc:
             self.log(f"Could not save results cache: {exc}")
 
@@ -788,14 +820,19 @@ class ScannerApp:
         try:
             with open(DEVICES_FILE, encoding="utf-8") as fh:
                 rows = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            self._write_log(f"devices.json is unreadable ({exc}); starting with an empty table.")
             return
         allowed = {f.name for f in dataclasses.fields(Device)}
-        for row in rows:
-            dev = Device(**{k: v for k, v in row.items() if k in allowed})
-            self._upsert_device(dev)
-        if rows:
-            self._write_log(f"Loaded {len(rows)} cached device(s) from last session. "
+        loaded = 0
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                self._upsert_device(Device(**{k: v for k, v in row.items() if k in allowed}))
+                loaded += 1
+            except (TypeError, AttributeError):
+                continue  # skip a malformed entry, keep the rest
+        if loaded:
+            self._write_log(f"Loaded {loaded} cached device(s) from last session. "
                             f"Use Update to refresh, New Scan to start over.")
 
     def on_save_log(self) -> None:
