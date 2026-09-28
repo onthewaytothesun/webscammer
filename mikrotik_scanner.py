@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import base64
 import csv
+import dataclasses
 import json
 import os
 import queue
 import threading
+import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from tkinter import (
@@ -42,11 +44,14 @@ from core import Device, backup_filename, dedupe_devices, expand_targets, parse_
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+DEVICES_FILE = os.path.join(APP_DIR, "devices.json")  # cached scan results
 BACKUP_DIR = os.path.join(APP_DIR, "Backups")
+CSV_DELIMITER = ";"  # Excel-friendly in RU locale; "Mgmt IP" is the reach address
 
 COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last seen", "Status")
-CHECK_ON = "☑"   # ☑
-CHECK_OFF = "☐"  # ☐
+CHECK_ON = "☑"
+CHECK_OFF = "☐"
+UPDATE_GLYPH = "⟳"  # per-row refresh button
 
 
 class ScannerApp:
@@ -82,11 +87,19 @@ class ScannerApp:
 
         self._build_ui()
         self._load_settings()
+        self._load_devices()
         self.root.after(100, self._drain_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
+        # bigger table rows so the check / update glyphs are easy to hit
+        style = ttk.Style(self.root)
+        style.configure("Treeview", font=("TkDefaultFont", 11), rowheight=28)
+        style.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
+        # copy/paste for entries and log, independent of keyboard layout
+        self._install_clipboard_bindings()
+
         form = ttk.Frame(self.root, padding=6)
         form.pack(fill=X)
 
@@ -94,6 +107,7 @@ class ScannerApp:
             ttk.Label(parent, text=label).pack(side=LEFT, padx=(4, 2))
             e = ttk.Entry(parent, textvariable=var, width=width, show=show)
             e.pack(side=LEFT)
+            self._attach_context_menu(e)
             return e
 
         field(form, "Username:", self.var_user, 12)
@@ -134,11 +148,13 @@ class ScannerApp:
         cmd_frame = ttk.Frame(nb)
         self.txt_command = ScrolledText(cmd_frame, height=8, wrap="word")
         self.txt_command.pack(fill=BOTH, expand=True)
+        self._attach_context_menu(self.txt_command)
         nb.add(cmd_frame, text="Command")
 
         out_frame = ttk.Frame(nb)
-        self.txt_output = ScrolledText(out_frame, height=8, wrap="word", state="disabled")
+        self.txt_output = ScrolledText(out_frame, height=8, wrap="word")
         self.txt_output.pack(fill=BOTH, expand=True)
+        self._make_readonly(self.txt_output)  # selectable & copyable, not editable
         nb.add(out_frame, text="Output / Log")
         self.notebook = nb
 
@@ -149,10 +165,12 @@ class ScannerApp:
         # table
         table_frame = ttk.Frame(self.root)
         table_frame.pack(fill=BOTH, expand=True, padx=6, pady=2)
-        cols = ("check",) + COLUMNS
+        cols = ("check", "upd") + COLUMNS
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="none")
         self.tree.heading("check", text=CHECK_OFF, command=self.toggle_all)
-        self.tree.column("check", width=34, anchor="center", stretch=False)
+        self.tree.column("check", width=46, anchor="center", stretch=False)
+        self.tree.heading("upd", text=UPDATE_GLYPH)
+        self.tree.column("upd", width=40, anchor="center", stretch=False)
         for col in COLUMNS:
             self.tree.heading(col, text=col, command=lambda c=col: self.sort_by(c))
             self.tree.column(col, width=150, anchor="w")
@@ -175,6 +193,77 @@ class ScannerApp:
         ttk.Button(bottom, text="Export", command=self.on_export).pack(side=RIGHT, padx=2)
         ttk.Button(bottom, text="Import", command=self.on_import).pack(side=RIGHT, padx=2)
 
+    # ---------------------------------------------------- clipboard helpers
+    def _install_clipboard_bindings(self) -> None:
+        """Ctrl+C/V/X/A by physical key code, so copy/paste also works on a
+        Cyrillic (or any non-Latin) keyboard layout, where Ctrl+С etc. produce
+        a different keysym and the default bindings don't fire."""
+        win = {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>", 65: "all"}
+        x11 = {54: "<<Copy>>", 55: "<<Paste>>", 53: "<<Cut>>", 38: "all"}
+
+        def dispatch(event):
+            action = win.get(event.keycode) or x11.get(event.keycode)
+            if not action:
+                return None
+            if action == "all":
+                self._select_all(event.widget)
+            else:
+                self._safe_event(event.widget, action)
+            return "break"
+
+        self.root.bind_all("<Control-KeyPress>", dispatch)
+
+    @staticmethod
+    def _safe_event(widget, virtual: str) -> None:
+        try:
+            widget.event_generate(virtual)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _select_all(widget) -> None:
+        try:
+            if isinstance(widget, (tk.Text,)):
+                widget.tag_add("sel", "1.0", "end-1c")
+            else:
+                widget.select_range(0, END)
+                widget.icursor(END)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _attach_context_menu(self, widget, readonly: bool = False) -> None:
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Копировать", command=lambda: self._safe_event(widget, "<<Copy>>"))
+        if not readonly:
+            menu.add_command(label="Вставить", command=lambda: self._safe_event(widget, "<<Paste>>"))
+            menu.add_command(label="Вырезать", command=lambda: self._safe_event(widget, "<<Cut>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: self._select_all(widget))
+
+        def popup(event):
+            widget.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", popup)
+
+    def _make_readonly(self, text) -> None:
+        """Let the user select and copy from a Text but not edit it."""
+        allowed = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+                   "Shift_L", "Shift_R", "Control_L", "Control_R"}
+
+        def block(event):
+            if event.state & 0x4:  # Control held -> copy / select-all
+                return None
+            if event.keysym in allowed:
+                return None
+            return "break"
+
+        text.bind("<Key>", block)
+        self._attach_context_menu(text, readonly=True)
+
     # ------------------------------------------------------------- helpers
     def log(self, message: str) -> None:
         # mirror every human-facing line into the log file too
@@ -186,10 +275,8 @@ class ScannerApp:
 
     def _write_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
-        self.txt_output.configure(state="normal")
         self.txt_output.insert(END, f"[{stamp}] {message}\n")
         self.txt_output.see(END)
-        self.txt_output.configure(state="disabled")
 
     def _drain_queue(self) -> None:
         try:
@@ -214,6 +301,8 @@ class ScannerApp:
                         if ip in (dev.ip, dev.reach_ip) and self.tree.exists(iid):
                             dev.status = text
                             self.tree.set(iid, "Status", text)
+                elif kind == "save_devices":
+                    self._save_devices()
                 elif kind == "done":
                     self._scan_finished(payload)
         except queue.Empty:
@@ -231,7 +320,7 @@ class ScannerApp:
             if self.tree.exists(other):
                 self.tree.delete(other)
             del self.devices[other]
-        values = (CHECK_ON if iid in self.checked else CHECK_OFF,) + tuple(
+        values = (CHECK_ON if iid in self.checked else CHECK_OFF, UPDATE_GLYPH) + tuple(
             dev.as_row()[c] for c in COLUMNS
         )
         if self.tree.exists(iid):
@@ -246,17 +335,48 @@ class ScannerApp:
         if region != "cell":
             return
         col = self.tree.identify_column(event.x)
-        if col != "#1":  # checkbox column
-            return
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        if iid in self.checked:
-            self.checked.discard(iid)
-            self.tree.set(iid, "check", CHECK_OFF)
-        else:
-            self.checked.add(iid)
-            self.tree.set(iid, "check", CHECK_ON)
+        if col == "#1":  # checkbox column
+            if iid in self.checked:
+                self.checked.discard(iid)
+                self.tree.set(iid, "check", CHECK_OFF)
+            else:
+                self.checked.add(iid)
+                self.tree.set(iid, "check", CHECK_ON)
+        elif col == "#2":  # per-row update button
+            self.on_update_one(iid)
+
+    def on_update_one(self, iid: str) -> None:
+        """Reconnect to one device and refresh its row."""
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Update", "A scan is already running.")
+            return
+        cfg = self._read_config()
+        self.tree.set(iid, "Status", "Updating…")
+
+        def work():
+            ip = dev.reach_ip
+            try:
+                fresh = core.scan_host(
+                    ip, cfg["user"], cfg["password"],
+                    cfg["api_ssl_port"], plain_port=8728,
+                    timeout=cfg["timeout"], retries=cfg["retries"], logger=self.logger,
+                )
+                fresh = dedupe_devices([fresh])[0]  # keep bridge1 as the shown IP
+                fresh.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.log(f"{ip}: updated {fresh.identity or fresh.board_name} [{fresh.status}]")
+                self.ui_queue.put(("device", fresh))
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"{ip}: update failed: {type(exc).__name__}: {exc}")
+                self.ui_queue.put(("status", (iid, f"Error: {type(exc).__name__}: {exc}")))
+            self.ui_queue.put(("save_devices", None))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle_all(self) -> None:
         all_iids = self.tree.get_children("")
@@ -345,6 +465,14 @@ class ScannerApp:
     def on_scan(self) -> None:
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Scan", "A scan is already running.")
+            return
+        if self.devices and not messagebox.askyesno(
+            "New Scan",
+            "Текущие результаты будут удалены, а таблица очищена.\n\n"
+            "Чтобы дополнить/обновить существующие результаты без потери, "
+            "используйте кнопку Update.\n\nВсё равно начать новый скан?",
+            icon="warning", default="no",
+        ):
             return
         targets = self._targets_or_warn()
         if targets is None:
@@ -446,6 +574,7 @@ class ScannerApp:
         self.btn_pause.configure(state="disabled", text="Pause")
         self.btn_stop.configure(state="disabled")
         self._write_log(f"Scan complete: {len(deduped)} unique device(s).")
+        self._save_devices()  # cache results so a restart doesn't require rescanning
 
     def on_pause(self) -> None:
         if self.pause_event.is_set():
@@ -600,10 +729,13 @@ class ScannerApp:
         )
         if not path:
             return
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            # "Mgmt IP" = the address the router actually answers on, so an
-            # imported list can still be backed up / sent commands
-            writer = csv.DictWriter(fh, fieldnames=COLUMNS + ("Mgmt IP",))
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            # "Mgmt IP" = the address the router actually answered on during the
+            # scan, so imported rows can still be backed up / sent commands
+            # (the IP column shows the bridge1 address, which may be unroutable).
+            writer = csv.DictWriter(
+                fh, fieldnames=COLUMNS + ("Mgmt IP",), delimiter=CSV_DELIMITER
+            )
             writer.writeheader()
             for dev in self.devices.values():
                 writer.writerow({**dev.as_row(), "Mgmt IP": dev.reach_ip})
@@ -615,8 +747,14 @@ class ScannerApp:
         )
         if not path:
             return
-        with open(path, newline="", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh)
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            sample = fh.read(2048)
+            fh.seek(0)
+            try:
+                delim = csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
+            except csv.Error:
+                delim = CSV_DELIMITER
+            reader = csv.DictReader(fh, delimiter=delim)
             count = 0
             for row in reader:
                 dev = Device(
@@ -632,7 +770,33 @@ class ScannerApp:
                 )
                 self._upsert_device(dev)
                 count += 1
+        self._save_devices()
         self.log(f"Imported {count} row(s) from {path}")
+
+    # ------------------------------------------------- cached scan results
+    def _save_devices(self) -> None:
+        try:
+            rows = [dataclasses.asdict(d) for d in self.devices.values()]
+            with open(DEVICES_FILE, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, indent=1)
+        except (OSError, TypeError) as exc:
+            self.log(f"Could not save results cache: {exc}")
+
+    def _load_devices(self) -> None:
+        if not os.path.exists(DEVICES_FILE):
+            return
+        try:
+            with open(DEVICES_FILE, encoding="utf-8") as fh:
+                rows = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return
+        allowed = {f.name for f in dataclasses.fields(Device)}
+        for row in rows:
+            dev = Device(**{k: v for k, v in row.items() if k in allowed})
+            self._upsert_device(dev)
+        if rows:
+            self._write_log(f"Loaded {len(rows)} cached device(s) from last session. "
+                            f"Use Update to refresh, New Scan to start over.")
 
     def on_save_log(self) -> None:
         import shutil
@@ -719,6 +883,7 @@ class ScannerApp:
     def _on_close(self) -> None:
         self.stop_event.set()
         self._maybe_save_settings()
+        self._save_devices()  # persist statuses (backups/commands) too
         self.root.destroy()
 
 

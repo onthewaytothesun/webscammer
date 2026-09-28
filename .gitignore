@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 settings.json
+devices.json
 Backups/
+logs/
