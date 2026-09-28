@@ -274,6 +274,64 @@ def _try_plain_api(
         return None
 
 
+# TLS cipher profiles tried in order. Some RouterOS builds drop the api-ssl
+# session right after login when a GCM cipher is negotiated; forcing CBC fixes
+# it. None = broad default list (GCM allowed).
+_CIPHER_PROFILES = [
+    (None, "default"),
+    ("ADH-AES256-SHA:ADH-AES128-SHA:AECDH-AES256-SHA:AECDH-AES128-SHA:"
+     "AES256-SHA:AES128-SHA:@SECLEVEL=0", "CBC"),
+]
+
+
+class _AuthError(Exception):
+    """Wraps a definitive login failure so cipher escalation is skipped."""
+
+
+def _poll_ssl_with_retries(
+    ip, username, password, api_ssl_port, timeout, retries, ciphers, logger,
+) -> Device:
+    """One cipher profile: connect + login + collect, retrying transient drops.
+
+    Raises _AuthError on bad credentials, ssl.SSLError on TLS-level failure
+    (so the caller can try the next cipher profile), or the last transient
+    error after exhausting retries.
+    """
+    last_exc: Exception = RouterOSError("no attempt made")
+    for attempt in range(retries + 1):
+        api = RouterOSApi(
+            ip, username, password, port=api_ssl_port, use_ssl=True,
+            timeout=timeout, logger=logger, ciphers=ciphers,
+        )
+        started = time.time()
+        try:
+            api.connect()
+        except ssl.SSLError:
+            api.close()
+            raise  # TLS-level: let caller try the next cipher profile
+        except (TimeoutError, OSError) as exc:
+            api.close()
+            last_exc = exc
+            _backoff(logger, ip, attempt, exc)
+            continue
+        try:
+            api.login()
+            dev = Device(ip=ip)
+            _collect_fields(api, dev)
+            dev.status = f"OK (API-SSL:{api_ssl_port})"
+            if logger:
+                logger.debug("%s: polled in %.1fs (attempt %d)",
+                             ip, time.time() - started, attempt + 1)
+            return dev
+        except Exception as exc:  # noqa: BLE001
+            api.close()
+            if _is_auth_failure(exc):
+                raise _AuthError(str(exc)) from exc
+            last_exc = exc
+            _backoff(logger, ip, attempt, exc)  # transient drop -> retry
+    raise last_exc
+
+
 def scan_host(
     ip: str,
     username: str,
@@ -286,59 +344,36 @@ def scan_host(
 ) -> Device:
     """Poll one host over the RouterOS API, robustly.
 
-    Primary transport is API-SSL (TLS) on api_ssl_port. Behaviour by failure:
-      - TLS handshake fails (cipher/proto)  -> surface it (retry won't help).
+    Primary transport is API-SSL. For each cipher profile it connects, logs in
+    and collects, retrying transient post-login drops `retries` times. If a
+    profile keeps failing at the TLS level (handshake or a GCM-triggered
+    session drop), the next cipher profile (CBC-only) is tried. Behaviour:
       - api_ssl_port refused (port closed)  -> fall back to plain API once.
-      - session drops after login, timeout  -> retry the SAME transport
-        (up to `retries` extra attempts) because it's transient.
       - login rejected (bad credentials)    -> surface immediately, no retry.
-    The Status field records which transport won. Raises the last error if
-    every attempt fails.
+    Raises the last error if everything fails.
     """
     last_exc: Exception = RouterOSError("no attempt made")
-    for attempt in range(retries + 1):
-        api = RouterOSApi(
-            ip, username, password,
-            port=api_ssl_port, use_ssl=True, timeout=timeout, logger=logger,
-        )
-        started = time.time()
-        # -- establish TLS --
+    for ciphers, name in _CIPHER_PROFILES:
         try:
-            if logger:
-                logger.debug("%s: API-SSL attempt %d/%d", ip, attempt + 1, retries + 1)
-            api.connect()
+            if logger and ciphers is not None:
+                logger.debug("%s: retrying with cipher profile '%s'", ip, name)
+            return _poll_ssl_with_retries(
+                ip, username, password, api_ssl_port, timeout, retries, ciphers, logger,
+            )
+        except _AuthError as exc:
+            raise RouterOSError(str(exc)) from exc  # credentials wrong; stop
         except ssl.SSLError as exc:
-            api.close()
-            raise exc  # handshake-level; retrying identically won't help
+            last_exc = exc  # TLS-level failure -> try next cipher profile
+            continue
         except ConnectionRefusedError as exc:
-            api.close()
             dev = _try_plain_api(ip, username, password, plain_port,
                                  api_ssl_port, timeout, logger)
             if dev is not None:
                 return dev
-            raise exc  # api-ssl closed and no plain API either
-        except (TimeoutError, OSError) as exc:
-            api.close()
+            raise exc  # api-ssl port closed and no plain API either
+        except Exception as exc:  # noqa: BLE001 - timeout etc., already retried
             last_exc = exc
-            _backoff(logger, ip, attempt, exc)
-            continue  # connect timed out -> retry
-        # -- authenticate + collect --
-        try:
-            api.login()
-            dev = Device(ip=ip)
-            _collect_fields(api, dev)
-            dev.status = f"OK (API-SSL:{api_ssl_port})"
-            if logger:
-                logger.debug("%s: polled in %.1fs (attempt %d)",
-                             ip, time.time() - started, attempt + 1)
-            return dev
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if _is_auth_failure(exc):
-                api.close()
-                raise  # credentials are wrong; no point retrying
-            api.close()
-            _backoff(logger, ip, attempt, exc)  # transient drop -> retry same transport
+            break
     raise last_exc
 
 

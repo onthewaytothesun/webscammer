@@ -31,6 +31,7 @@ class RouterOSApi:
         use_ssl: bool = False,
         timeout: float = 8.0,
         logger=None,
+        ciphers: Optional[str] = None,
     ) -> None:
         self.host = host
         self.username = username
@@ -39,6 +40,10 @@ class RouterOSApi:
         self.use_ssl = use_ssl
         self.timeout = timeout
         self.logger = logger
+        # Optional explicit OpenSSL cipher string. When None a broad list is
+        # used; callers can force e.g. a CBC-only list for RouterOS builds that
+        # drop the api-ssl session on GCM ciphers.
+        self.ciphers = ciphers
         self.sock: Optional[socket.socket] = None
 
     def _log(self, level: str, msg: str, *args) -> None:
@@ -59,11 +64,24 @@ class RouterOSApi:
                 ctx.minimum_version = ssl.TLSVersion.TLSv1
             except (ValueError, AttributeError):
                 pass
+            # When a specific (e.g. CBC) cipher list is forced, cap at TLS 1.2:
+            # TLS 1.3 GCM suites cannot be disabled via set_ciphers and would
+            # otherwise be re-selected, defeating the point of forcing CBC.
+            if self.ciphers:
+                try:
+                    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+                except (ValueError, AttributeError):
+                    pass
             # api-ssl without an imported certificate negotiates ANONYMOUS
             # ciphers (ADH-*). Python rejects those by default, which shows up
             # as SSLV3_ALERT_HANDSHAKE_FAILURE. Allow them and drop SECLEVEL so
-            # both cert-based and cert-less routers work.
-            for ciphers in ("ALL:@SECLEVEL=0", "ADH:@SECLEVEL=0", "DEFAULT:@SECLEVEL=0"):
+            # both cert-based and cert-less routers work. A caller may force a
+            # specific cipher list (e.g. CBC-only) via self.ciphers.
+            candidates = (
+                [self.ciphers] if self.ciphers
+                else ["ALL:@SECLEVEL=0", "ADH:@SECLEVEL=0", "DEFAULT:@SECLEVEL=0"]
+            )
+            for ciphers in candidates:
                 try:
                     ctx.set_ciphers(ciphers)
                     break
