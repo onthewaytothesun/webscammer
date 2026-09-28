@@ -18,6 +18,7 @@ import dataclasses
 import json
 import os
 import queue
+import subprocess
 import threading
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +54,7 @@ COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last seen", "
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 UPDATE_GLYPH = "⟳"  # per-row refresh button
+WINBOX_LABEL = "▶ Winbox"  # per-row launcher, last column
 
 
 class ScannerApp:
@@ -79,6 +81,7 @@ class ScannerApp:
         self.var_network = StringVar()
         self.var_api_port = StringVar(value="8729")
         self.var_ssh_port = StringVar(value="22")
+        self.var_winbox_port = StringVar(value="8291")
         self.var_threads = StringVar(value="30")
         self.var_timeout = StringVar(value="10")
         self.var_retries = StringVar(value="2")
@@ -119,6 +122,7 @@ class ScannerApp:
         field(form, "Network:", self.var_network, 18)
         field(form, "API-SSL:", self.var_api_port, 6)
         field(form, "SSH:", self.var_ssh_port, 6)
+        field(form, "Winbox:", self.var_winbox_port, 6)
         field(form, "Threads:", self.var_threads, 5)
         field(form, "Timeout:", self.var_timeout, 4)
         field(form, "Retries:", self.var_retries, 3)
@@ -169,7 +173,7 @@ class ScannerApp:
         # table
         table_frame = ttk.Frame(self.root)
         table_frame.pack(fill=BOTH, expand=True, padx=6, pady=2)
-        cols = ("check", "upd") + COLUMNS
+        cols = ("check", "upd") + COLUMNS + ("winbox",)
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="none")
         self.tree.heading("check", text=CHECK_OFF, command=self.toggle_all)
         self.tree.column("check", width=46, anchor="center", stretch=False)
@@ -178,6 +182,8 @@ class ScannerApp:
         for col in COLUMNS:
             self.tree.heading(col, text=col, command=lambda c=col: self.sort_by(c))
             self.tree.column(col, width=150, anchor="w")
+        self.tree.heading("winbox", text="Winbox")
+        self.tree.column("winbox", width=90, anchor="center", stretch=False)
         self.tree.column("IP", width=120)
         self.tree.column("Status", width=220)
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
@@ -354,7 +360,7 @@ class ScannerApp:
             del self.devices[other]
         values = (CHECK_ON if iid in self.checked else CHECK_OFF, UPDATE_GLYPH) + tuple(
             dev.as_row()[c] for c in COLUMNS
-        )
+        ) + (WINBOX_LABEL,)
         if self.tree.exists(iid):
             self.tree.item(iid, values=values)
         else:
@@ -379,6 +385,46 @@ class ScannerApp:
                 self.tree.set(iid, "check", CHECK_ON)
         elif col == "#2":  # per-row update button
             self.on_update_one(iid)
+        elif col == "#%d" % (len(COLUMNS) + 3):  # last column: Winbox launcher
+            self.on_winbox(iid)
+
+    def _find_winbox(self):
+        """winbox.exe (any winbox*.exe) sitting next to the program."""
+        try:
+            names = sorted(os.listdir(APP_DIR))
+        except OSError:
+            return None
+        for name in names:
+            low = name.lower()
+            if low.startswith("winbox") and low.endswith(".exe"):
+                return os.path.join(APP_DIR, name)
+        return None
+
+    def on_winbox(self, iid: str) -> None:
+        """Open WinBox for one device with the username/password from the form."""
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        exe = self._find_winbox()
+        if exe is None:
+            messagebox.showerror(
+                "Winbox", f"winbox.exe не найден.\nПоложите его в папку с программой:\n{APP_DIR}")
+            return
+        cfg = self._read_config()
+        if not cfg["user"]:
+            messagebox.showwarning("Winbox", "Введите Username (и Password) в верхней панели.")
+            return
+        # the address the scan reached (the bridge1 one shown in the table may
+        # be unreachable from this PC) plus the Winbox port
+        address = f"{dev.reach_ip}:{cfg['winbox_port']}"
+        try:
+            # argument list, no shell: nothing in the password is interpreted
+            subprocess.Popen([exe, address, cfg["user"], cfg["password"]], cwd=APP_DIR)
+        except OSError as exc:
+            self.log(f"{dev.ip}: could not start Winbox: {exc}")
+            messagebox.showerror("Winbox", f"Не удалось запустить Winbox:\n{exc}")
+            return
+        self.log(f"Winbox started for {address} (user {cfg['user']})")  # never log the password
 
     def on_update_one(self, iid: str) -> None:
         """Reconnect to one device and refresh its row."""
@@ -475,6 +521,10 @@ class ScannerApp:
         except ValueError:
             ssh_port = 22
         try:
+            winbox_port = int(self.var_winbox_port.get() or 8291)
+        except ValueError:
+            winbox_port = 8291
+        try:
             timeout = max(1.0, float(self.var_timeout.get()))
         except ValueError:
             timeout = 10.0
@@ -488,6 +538,7 @@ class ScannerApp:
             "api_ssl_port": api_ssl_port,
             "threads": threads,
             "ssh_port": ssh_port,
+            "winbox_port": winbox_port,
             "cmdtype": self.var_cmdtype.get(),
             "timeout": timeout,
             "retries": retries,
@@ -877,6 +928,7 @@ class ScannerApp:
             "api_port": self.var_api_port.get(),
             "threads": self.var_threads.get(),
             "ssh_port": self.var_ssh_port.get(),
+            "winbox_port": self.var_winbox_port.get(),
             "cmdtype": self.var_cmdtype.get(),
             "timeout": self.var_timeout.get(),
             "retries": self.var_retries.get(),
@@ -905,6 +957,7 @@ class ScannerApp:
         self.var_api_port.set(data.get("api_port", "8729"))
         self.var_threads.set(data.get("threads", "30"))
         self.var_ssh_port.set(data.get("ssh_port", "22"))
+        self.var_winbox_port.set(data.get("winbox_port", "8291"))
         self.var_cmdtype.set(data.get("cmdtype", "API/SSL"))
         self.var_timeout.set(data.get("timeout", "10"))
         self.var_retries.set(data.get("retries", "2"))
