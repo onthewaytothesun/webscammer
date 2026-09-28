@@ -41,8 +41,7 @@ class RouterOSApi:
         self.timeout = timeout
         self.logger = logger
         # Optional explicit OpenSSL cipher string. When None a broad list is
-        # used; callers can force e.g. a CBC-only list for RouterOS builds that
-        # drop the api-ssl session on GCM ciphers.
+        # used; callers can force e.g. a CBC-only list as a fallback.
         self.ciphers = ciphers
         self.sock: Optional[socket.socket] = None
 
@@ -218,8 +217,6 @@ class RouterOSApi:
                 if w.startswith("="):
                     key, _, val = w[1:].partition("=")
                     attrs[key] = val
-                elif w.startswith("=ret="):
-                    attrs["ret"] = w[5:]
             if reply_type == "!re":
                 replies.append(attrs)
             elif reply_type == "!done":
@@ -238,13 +235,21 @@ class RouterOSApi:
         # the session UNAUTHENTICATED, so the next command was dropped by the
         # router (SSLEOFError right after "login"). So: only treat a !done
         # WITHOUT a challenge as success; otherwise do the MD5 response step.
+        modern_ok = True
         try:
             replies = self.talk(
                 ["/login", "=name=" + self.username, "=password=" + self.password]
             )
         except RouterOSError as exc:
+            # Modern routers reject bad credentials here. Very old ones may
+            # reject the name/password form, so ask for a bare challenge; if
+            # that is refused too, the credentials are wrong.
             self._log("debug", "%s modern login rejected (%s), trying challenge", self.host, exc)
-            replies = self.talk(["/login"])
+            modern_ok = False
+            try:
+                replies = self.talk(["/login"])
+            except RouterOSError:
+                raise RouterOSError("login failed (check username/password)") from exc
 
         challenge_hex = ""
         for row in replies:
@@ -252,6 +257,10 @@ class RouterOSApi:
                 challenge_hex = row["ret"]
 
         if not challenge_hex:
+            if not modern_ok:
+                # the name/password login was refused and no challenge came
+                # back, so nothing authenticated us
+                raise RouterOSError("login failed (check username/password)")
             self._log("debug", "%s login ok (plaintext)", self.host)
             return  # modern login already authenticated
 

@@ -152,7 +152,9 @@ def dedupe_devices(devices: List[Device]) -> List[Device]:
     for key in order:
         group = by_key[key]
         chosen = group[0]
-        preferred = bridge_ip(chosen.addresses)
+        # any member that managed to read the address list will do
+        addresses = next((m.addresses for m in group if m.addresses), [])
+        preferred = bridge_ip(addresses)
         if preferred:
             # Prefer the group member whose scanned IP is the bridge1 IP.
             for member in group:
@@ -244,11 +246,9 @@ def _collect_fields(api: RouterOSApi, dev: Device) -> None:
     except RouterOSError:
         pass
 
-
-# Post-handshake errors that mean "the TLS session dropped mid-conversation"
-# (seen on some RouterOS devices right after login). These are transient, so
-# we retry the SAME transport with a fresh connection rather than falling back.
-_TRANSIENT_SESSION_ERRORS = (ssl.SSLError, ConnectionResetError, TimeoutError, OSError)
+    if not (dev.identity or dev.board_name or dev.routeros):
+        # every print was refused: don't report an empty row as "OK"
+        raise RouterOSError("router returned no data (check user permissions)")
 
 
 def _is_auth_failure(exc: Exception) -> bool:
@@ -274,9 +274,8 @@ def _try_plain_api(
         return None
 
 
-# TLS cipher profiles tried in order. Some RouterOS builds drop the api-ssl
-# session right after login when a GCM cipher is negotiated; forcing CBC fixes
-# it. None = broad default list (GCM allowed).
+# TLS cipher profiles tried in order when a profile fails at the TLS level.
+# None = broad default list; the CBC list is a compatibility fallback.
 _CIPHER_PROFILES = [
     (None, "default"),
     ("ADH-AES256-SHA:ADH-AES128-SHA:AECDH-AES256-SHA:AECDH-AES128-SHA:"
@@ -306,14 +305,14 @@ def _poll_ssl_with_retries(
         started = time.time()
         try:
             api.connect()
-        except ssl.SSLError:
+        except OSError:
+            # Covers TLS handshake errors (caller tries the next cipher
+            # profile), refused ports (caller tries plain API) and connect
+            # timeouts. A connect timeout almost always means nothing lives at
+            # that IP, so retrying it only multiplies scan time on empty
+            # addresses; retries are reserved for sessions that drop mid-way.
             api.close()
-            raise  # TLS-level: let caller try the next cipher profile
-        except (TimeoutError, OSError) as exc:
-            api.close()
-            last_exc = exc
-            _backoff(logger, ip, attempt, exc)
-            continue
+            raise
         try:
             api.login()
             dev = Device(ip=ip)
@@ -386,9 +385,11 @@ def _backoff(logger, ip: str, attempt: int, exc: Exception) -> None:
 # ---------------------------------------------------------------------------
 # SSH scan (alternative transport that avoids api-ssl TLS entirely)
 # ---------------------------------------------------------------------------
-# Each line prints one labelled value, so the output needs no table parsing.
-# routerboard/license are guarded because CHR/x86 have no routerboard.
-SSH_SCAN_SCRIPT = "\n".join([
+# Each statement prints one labelled value, so the output needs no table
+# parsing. routerboard/license are guarded because CHR/x86 have no
+# routerboard. Sent as ONE line (";"-separated): a single-line exec is the
+# most portable form across RouterOS versions.
+SSH_SCAN_SCRIPT = "; ".join([
     ':put ("IDENTITY=" . [:tostr [/system identity get name]])',
     ':put ("BOARD=" . [:tostr [/system resource get board-name]])',
     ':put ("VERSION=" . [:tostr [/system resource get version]])',

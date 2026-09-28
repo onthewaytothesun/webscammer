@@ -77,7 +77,7 @@ class ScannerApp:
         self.var_threads = StringVar(value="30")
         self.var_timeout = StringVar(value="10")
         self.var_retries = StringVar(value="2")
-        self.var_scanvia = StringVar(value="API-SSL")
+        self.var_scanvia = StringVar(value="SSH")
         self.var_cmdtype = StringVar(value="API/SSL")
         self.var_save = BooleanVar(value=False)
         self.var_find = StringVar()
@@ -138,7 +138,6 @@ class ScannerApp:
         # command / output notebook (single big box, two tabs)
         nb = ttk.Notebook(self.root)
         nb.pack(fill=BOTH, expand=False, padx=6, pady=4)
-        from tkinter import Text
         from tkinter.scrolledtext import ScrolledText
 
         cmd_frame = ttk.Frame(nb)
@@ -217,6 +216,13 @@ class ScannerApp:
                     iid, text = payload
                     if self.tree.exists(iid):
                         self.tree.set(iid, "Status", text)
+                        self.devices[iid].status = text
+                elif kind == "status_ip":
+                    ip, text = payload
+                    for iid, dev in self.devices.items():
+                        if dev.ip == ip and self.tree.exists(iid):
+                            dev.status = text
+                            self.tree.set(iid, "Status", text)
                 elif kind == "done":
                     self._scan_finished(payload)
         except queue.Empty:
@@ -225,6 +231,15 @@ class ScannerApp:
 
     def _upsert_device(self, dev: Device) -> None:
         iid = dev.key or dev.ip
+        # A row for this IP may exist under another id (imported rows are
+        # keyed by IP, scanned ones by serial): replace it, keep its checkbox.
+        for other in [i for i, d in self.devices.items() if d.ip == dev.ip and i != iid]:
+            if other in self.checked:
+                self.checked.discard(other)
+                self.checked.add(iid)
+            if self.tree.exists(other):
+                self.tree.delete(other)
+            del self.devices[other]
         values = (CHECK_ON if iid in self.checked else CHECK_OFF,) + tuple(
             dev.as_row()[c] for c in COLUMNS
         )
@@ -285,7 +300,11 @@ class ScannerApp:
         needle = self.var_find.get().strip().lower()
         if not needle:
             return
-        for iid in self.tree.get_children(""):
+        rows = list(self.tree.get_children(""))
+        # continue after the current match so repeated Find walks all hits
+        current = self.tree.selection()
+        start = rows.index(current[0]) + 1 if current and current[0] in rows else 0
+        for iid in rows[start:] + rows[:start]:
             row = " ".join(self.tree.set(iid, c) for c in COLUMNS).lower()
             if needle in row:
                 self.tree.selection_set(iid)
@@ -337,7 +356,9 @@ class ScannerApp:
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Scan", "A scan is already running.")
             return
-        targets = expand_targets(self.var_network.get())
+        targets = self._targets_or_warn()
+        if targets is None:
+            return
         if not targets:
             messagebox.showerror("Scan", "Enter a network, e.g. 192.168.0.0/24")
             return
@@ -354,12 +375,23 @@ class ScannerApp:
             messagebox.showwarning("Update", "A scan is already running.")
             return
         # rescan known devices plus any other host in the subnet
+        subnet = self._targets_or_warn()
+        if subnet is None:
+            return
         targets = set(dev.ip for dev in self.devices.values())
-        targets.update(expand_targets(self.var_network.get()))
+        targets.update(subnet)
         if not targets:
             messagebox.showinfo("Update", "Nothing to update yet — run a scan first.")
             return
         self._start_scan(sorted(targets), "Update")
+
+    def _targets_or_warn(self):
+        """Expand the Network field; None (after a message) if it's invalid."""
+        try:
+            return expand_targets(self.var_network.get())
+        except ValueError as exc:
+            messagebox.showerror("Network", f"Can't parse network: {exc}")
+            return None
 
     def _start_scan(self, targets: list[str], label: str) -> None:
         self.stop_event.clear()
@@ -411,9 +443,12 @@ class ScannerApp:
                 dev.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.log(f"{ip}: found {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
+                self.ui_queue.put(("device", dev))  # show it right away
             except Exception as exc:  # noqa: BLE001 - report every failure
                 dev = None
                 self.log(f"{ip}: {type(exc).__name__}: {exc}")
+                # a device already in the table must not keep a stale "OK"
+                self.ui_queue.put(("status_ip", (ip, f"Error: {type(exc).__name__}: {exc}")))
             finally:
                 with lock:
                     done += 1
@@ -486,7 +521,8 @@ class ScannerApp:
 
     def _run_api_commands(self, dev: Device, command: str, cfg: dict) -> str:
         api = RouterOSApi(dev.ip, cfg["user"], cfg["password"],
-                          port=cfg["api_ssl_port"], use_ssl=True, logger=self.logger)
+                          port=cfg["api_ssl_port"], use_ssl=True,
+                          timeout=cfg["timeout"], logger=self.logger)
         api.connect()
         chunks = []
         try:
@@ -596,6 +632,12 @@ class ScannerApp:
     def _maybe_save_settings(self) -> None:
         if self.var_save.get():
             self._save_settings()
+        elif os.path.exists(SETTINGS_FILE):
+            # Save was unticked: forget the stored settings (incl. password)
+            try:
+                os.remove(SETTINGS_FILE)
+            except OSError as exc:
+                self.log(f"Could not remove saved settings: {exc}")
 
     def _save_settings(self) -> None:
         data = {
@@ -635,7 +677,7 @@ class ScannerApp:
         self.var_threads.set(data.get("threads", "30"))
         self.var_timeout.set(data.get("timeout", "10"))
         self.var_retries.set(data.get("retries", "2"))
-        self.var_scanvia.set(data.get("scanvia", "API-SSL"))
+        self.var_scanvia.set(data.get("scanvia", "SSH"))
         self.var_cmdtype.set(data.get("cmdtype", "API/SSL"))
         self.var_save.set(data.get("save", False))
         if data.get("password"):
@@ -648,8 +690,7 @@ class ScannerApp:
 
     def _on_close(self) -> None:
         self.stop_event.set()
-        if self.var_save.get():
-            self._save_settings()
+        self._maybe_save_settings()
         self.root.destroy()
 
 

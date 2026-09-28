@@ -23,7 +23,7 @@ def _load_paramiko():
 
 
 def _open_ssh(host, username, password, port, timeout):
-    """Open an SSH client, tolerating RouterOS's older key-exchange algos."""
+    """Open a password-authenticated SSH client (no agent / key files)."""
     paramiko = _load_paramiko()
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -66,13 +66,26 @@ def ssh_scan_host(host, username, password, port=22, timeout=12.0, logger=None):
 
     if logger:
         logger.debug("%s: SSH scan on port %s", host, port)
-    client = _open_ssh(host, username, password, port, timeout)
+    try:
+        client = _open_ssh(host, username, password, port, timeout)
+    except Exception as exc:  # noqa: BLE001 - tag the stage for the log
+        if logger:
+            logger.debug("%s: SSH connect/auth failed: %r", host, exc)
+        raise
+    if logger:
+        logger.debug("%s: SSH connected and authenticated, running script", host)
     try:
         stdin, stdout, stderr = client.exec_command(SSH_SCAN_SCRIPT, timeout=timeout)
         out = stdout.read().decode("utf-8", "replace")
         err = stderr.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.debug("%s: SSH script did not finish: %r", host, exc)
+        raise
     finally:
         client.close()
+    if logger:
+        logger.debug("%s: SSH output: %r", host, out[:500])
     dev = parse_ssh_scan(out, host)
     if not (dev.identity or dev.board_name or dev.routeros):
         raise RuntimeError("no RouterOS data over SSH: " + (err.strip() or "empty output")[:160])
