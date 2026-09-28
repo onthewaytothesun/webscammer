@@ -6,8 +6,6 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import ssl  # noqa: E402
-
 from core import (  # noqa: E402
     Device,
     backup_filename,
@@ -15,7 +13,7 @@ from core import (  # noqa: E402
     dedupe_devices,
     expand_targets,
     parse_cli_to_api,
-    _worth_transport_fallback,
+    _is_auth_failure,
 )
 from routeros_api import RouterOSApi, RouterOSError  # noqa: E402
 
@@ -103,14 +101,12 @@ def test_length_encoding_roundtrip_boundaries():
         assert isinstance(encoded, bytes) and len(encoded) >= 1
 
 
-def test_transport_fallback_decision():
-    # wrong-transport-on-open-port errors -> worth retrying other transport
-    assert _worth_transport_fallback(ssl.SSLError("boom")) is True
-    assert _worth_transport_fallback(RouterOSError("connection closed by router")) is True
-    assert _worth_transport_fallback(ConnectionResetError()) is True
-    # port simply absent -> not worth retrying (would just waste another timeout)
-    assert _worth_transport_fallback(TimeoutError()) is False
-    assert _worth_transport_fallback(ConnectionRefusedError()) is False
+def test_auth_failure_detection():
+    # a rejected login is definitive -> caller must not retry or fall back
+    assert _is_auth_failure(RouterOSError("login failed (check username/password)")) is True
+    # a mid-session drop is NOT an auth failure -> caller should retry
+    assert _is_auth_failure(RouterOSError("connection closed by router")) is False
+    assert _is_auth_failure(TimeoutError()) is False
 
 
 def test_length_encoding_known_values():

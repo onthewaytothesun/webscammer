@@ -11,6 +11,8 @@ from __future__ import annotations
 import ipaddress
 import re
 import shlex
+import ssl
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Dict, List, Optional
@@ -186,69 +188,90 @@ def poll_device(
     api.connect()
     try:
         api.login()
-
-        try:
-            ident = api.talk(["/system/identity/print"])
-            if ident:
-                dev.identity = ident[0].get("name", "")
-        except RouterOSError:
-            pass
-
-        try:
-            res = api.talk(["/system/resource/print"])
-            if res:
-                dev.board_name = res[0].get("board-name", "")
-                dev.routeros = res[0].get("version", "")
-        except RouterOSError:
-            pass
-
-        try:
-            rb = api.talk(["/system/routerboard/print"])
-            if rb:
-                dev.key = rb[0].get("serial-number", "")
-                if not dev.board_name:
-                    dev.board_name = rb[0].get("model", "")
-        except RouterOSError:
-            pass
-
-        try:
-            lic = api.talk(["/system/license/print"])
-            if lic:
-                row = lic[0]
-                dev.license = row.get("nlevel") or row.get("level", "")
-                if not dev.key:
-                    dev.key = row.get("software-id", "")
-        except RouterOSError:
-            pass
-
-        try:
-            addrs = api.talk(["/ip/address/print"])
-            dev.addresses = [
-                {"address": a.get("address", ""), "interface": a.get("interface", "")}
-                for a in addrs
-            ]
-        except RouterOSError:
-            pass
-
+        _collect_fields(api, dev)
         dev.status = "OK"
     finally:
         api.close()
     return dev
 
 
-# Errors that mean "we reached an open port but spoke the wrong transport" —
-# worth retrying with the other transport. Timeout / refused mean the port is
-# simply not there, so we do NOT waste time retrying those.
-def _worth_transport_fallback(exc: Exception) -> bool:
-    import ssl as _ssl
+def _collect_fields(api: RouterOSApi, dev: Device) -> None:
+    """Run the inventory print commands on an already-logged-in session.
 
-    if isinstance(exc, _ssl.SSLError):
-        return True
-    if isinstance(exc, RouterOSError) and "connection closed" in str(exc).lower():
-        return True
-    if isinstance(exc, ConnectionResetError):
-        return True
-    return False
+    Missing sub-commands (older ROS, restricted user) are tolerated, but a
+    dropped connection (SSLEOFError / reset) propagates so the caller can retry.
+    """
+    try:
+        ident = api.talk(["/system/identity/print"])
+        if ident:
+            dev.identity = ident[0].get("name", "")
+    except RouterOSError:
+        pass
+
+    try:
+        res = api.talk(["/system/resource/print"])
+        if res:
+            dev.board_name = res[0].get("board-name", "")
+            dev.routeros = res[0].get("version", "")
+    except RouterOSError:
+        pass
+
+    try:
+        rb = api.talk(["/system/routerboard/print"])
+        if rb:
+            dev.key = rb[0].get("serial-number", "")
+            if not dev.board_name:
+                dev.board_name = rb[0].get("model", "")
+    except RouterOSError:
+        pass
+
+    try:
+        lic = api.talk(["/system/license/print"])
+        if lic:
+            row = lic[0]
+            dev.license = row.get("nlevel") or row.get("level", "")
+            if not dev.key:
+                dev.key = row.get("software-id", "")
+    except RouterOSError:
+        pass
+
+    try:
+        addrs = api.talk(["/ip/address/print"])
+        dev.addresses = [
+            {"address": a.get("address", ""), "interface": a.get("interface", "")}
+            for a in addrs
+        ]
+    except RouterOSError:
+        pass
+
+
+# Post-handshake errors that mean "the TLS session dropped mid-conversation"
+# (seen on some RouterOS devices right after login). These are transient, so
+# we retry the SAME transport with a fresh connection rather than falling back.
+_TRANSIENT_SESSION_ERRORS = (ssl.SSLError, ConnectionResetError, TimeoutError, OSError)
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    return isinstance(exc, RouterOSError) and "login failed" in str(exc).lower()
+
+
+def _try_plain_api(
+    ip: str, username: str, password: str,
+    plain_port: int, api_ssl_port: int, timeout: float, logger=None,
+) -> Optional[Device]:
+    """Fallback used only when the API-SSL port is genuinely closed/refused."""
+    if not plain_port or plain_port == api_ssl_port:
+        return None
+    try:
+        if logger:
+            logger.debug("%s: API-SSL port refused, trying plain API on %s", ip, plain_port)
+        dev = poll_device(ip, username, password, plain_port, False, timeout, logger=logger)
+        dev.status = f"OK (API:{plain_port})"
+        return dev
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.debug("%s: plain API %s also failed: %r", ip, plain_port, exc)
+        return None
 
 
 def scan_host(
@@ -257,36 +280,72 @@ def scan_host(
     password: str,
     api_ssl_port: int,
     plain_port: int = 8728,
-    timeout: float = 8.0,
+    timeout: float = 10.0,
+    retries: int = 2,
     logger=None,
 ) -> Device:
-    """Poll one host over the RouterOS API.
+    """Poll one host over the RouterOS API, robustly.
 
-    Tries API-SSL (TLS) on api_ssl_port first; if that port is open but the
-    transport was wrong (TLS/plain mismatch), retries plain API on plain_port.
-    The Status field records which transport succeeded. Raises the last error
-    if nothing worked.
+    Primary transport is API-SSL (TLS) on api_ssl_port. Behaviour by failure:
+      - TLS handshake fails (cipher/proto)  -> surface it (retry won't help).
+      - api_ssl_port refused (port closed)  -> fall back to plain API once.
+      - session drops after login, timeout  -> retry the SAME transport
+        (up to `retries` extra attempts) because it's transient.
+      - login rejected (bad credentials)    -> surface immediately, no retry.
+    The Status field records which transport won. Raises the last error if
+    every attempt fails.
     """
-    attempts = [(True, api_ssl_port, "API-SSL")]
-    if plain_port and plain_port != api_ssl_port:
-        attempts.append((False, plain_port, "API"))
-
     last_exc: Exception = RouterOSError("no attempt made")
-    for i, (use_ssl, port, label) in enumerate(attempts):
+    for attempt in range(retries + 1):
+        api = RouterOSApi(
+            ip, username, password,
+            port=api_ssl_port, use_ssl=True, timeout=timeout, logger=logger,
+        )
+        started = time.time()
+        # -- establish TLS --
         try:
             if logger:
-                logger.debug("%s: try %s on port %s", ip, label, port)
-            dev = poll_device(ip, username, password, port, use_ssl, timeout, logger=logger)
-            dev.status = f"OK ({label}:{port})"
-            return dev
-        except Exception as exc:  # noqa: BLE001 - decide whether to fall back
+                logger.debug("%s: API-SSL attempt %d/%d", ip, attempt + 1, retries + 1)
+            api.connect()
+        except ssl.SSLError as exc:
+            api.close()
+            raise exc  # handshake-level; retrying identically won't help
+        except ConnectionRefusedError as exc:
+            api.close()
+            dev = _try_plain_api(ip, username, password, plain_port,
+                                 api_ssl_port, timeout, logger)
+            if dev is not None:
+                return dev
+            raise exc  # api-ssl closed and no plain API either
+        except (TimeoutError, OSError) as exc:
+            api.close()
             last_exc = exc
+            _backoff(logger, ip, attempt, exc)
+            continue  # connect timed out -> retry
+        # -- authenticate + collect --
+        try:
+            api.login()
+            dev = Device(ip=ip)
+            _collect_fields(api, dev)
+            dev.status = f"OK (API-SSL:{api_ssl_port})"
             if logger:
-                logger.debug("%s: %s on port %s failed: %r", ip, label, port, exc)
-            more_attempts = i + 1 < len(attempts)
-            if not (more_attempts and _worth_transport_fallback(exc)):
-                break
+                logger.debug("%s: polled in %.1fs (attempt %d)",
+                             ip, time.time() - started, attempt + 1)
+            return dev
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _is_auth_failure(exc):
+                api.close()
+                raise  # credentials are wrong; no point retrying
+            api.close()
+            _backoff(logger, ip, attempt, exc)  # transient drop -> retry same transport
     raise last_exc
+
+
+def _backoff(logger, ip: str, attempt: int, exc: Exception) -> None:
+    if logger:
+        logger.debug("%s: attempt %d failed (%r), backing off", ip, attempt + 1, exc)
+    time.sleep(0.4 * (attempt + 1))
 
 
 # ---------------------------------------------------------------------------
