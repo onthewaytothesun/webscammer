@@ -30,6 +30,7 @@ class RouterOSApi:
         port: int = 8728,
         use_ssl: bool = False,
         timeout: float = 8.0,
+        logger=None,
     ) -> None:
         self.host = host
         self.username = username
@@ -37,22 +38,50 @@ class RouterOSApi:
         self.port = int(port)
         self.use_ssl = use_ssl
         self.timeout = timeout
+        self.logger = logger
         self.sock: Optional[socket.socket] = None
+
+    def _log(self, level: str, msg: str, *args) -> None:
+        if self.logger is not None:
+            getattr(self.logger, level)(msg, *args)
 
     # -- connection -------------------------------------------------------
     def connect(self) -> None:
+        self._log("debug", "%s:%s connect (ssl=%s)", self.host, self.port, self.use_ssl)
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_ssl:
-            ctx = ssl.create_default_context()
-            # RouterOS default certs are self-signed; operators trust their own
-            # devices, so verification is relaxed here (same as Winbox/API-SSL).
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            # RouterOS uses self-signed certs (or none); operators trust their
+            # own devices, so verification is relaxed (same as Winbox/API-SSL).
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             try:
-                ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
-            except ssl.SSLError:
+                ctx.minimum_version = ssl.TLSVersion.TLSv1
+            except (ValueError, AttributeError):
                 pass
-            raw = ctx.wrap_socket(raw, server_hostname=self.host)
+            # api-ssl without an imported certificate negotiates ANONYMOUS
+            # ciphers (ADH-*). Python rejects those by default, which shows up
+            # as SSLV3_ALERT_HANDSHAKE_FAILURE. Allow them and drop SECLEVEL so
+            # both cert-based and cert-less routers work.
+            for ciphers in ("ALL:@SECLEVEL=0", "ADH:@SECLEVEL=0", "DEFAULT:@SECLEVEL=0"):
+                try:
+                    ctx.set_ciphers(ciphers)
+                    break
+                except ssl.SSLError:
+                    continue
+            try:
+                raw = ctx.wrap_socket(raw, server_hostname=self.host)
+            except ssl.SSLError as exc:
+                self._log(
+                    "error",
+                    "%s:%s TLS handshake failed: %s (openssl=%s)",
+                    self.host, self.port, exc, ssl.OPENSSL_VERSION,
+                )
+                raise
+            self._log(
+                "debug", "%s:%s TLS %s cipher=%s",
+                self.host, self.port, raw.version(), raw.cipher(),
+            )
         raw.settimeout(self.timeout)
         self.sock = raw
 
@@ -187,9 +216,10 @@ class RouterOSApi:
         # RouterOS 6.43+ accepts plaintext login in a single sentence.
         try:
             self.talk(["/login", "=name=" + self.username, "=password=" + self.password])
+            self._log("debug", "%s login ok (plaintext)", self.host)
             return
-        except RouterOSError:
-            pass
+        except RouterOSError as exc:
+            self._log("debug", "%s plaintext login failed (%s), trying legacy", self.host, exc)
         # Legacy challenge/response login (pre-6.43).
         self._write_sentence(["/login"])
         challenge_hex = ""
@@ -203,11 +233,15 @@ class RouterOSApi:
             if sentence[0] == "!done":
                 break
             if sentence[0] in ("!trap", "!fatal"):
-                raise RouterOSError("login rejected")
+                raise RouterOSError("login failed (check username/password)")
         challenge = binascii.unhexlify(challenge_hex)
         md = hashlib.md5()
         md.update(b"\x00")
         md.update(self.password.encode("utf-8"))
         md.update(challenge)
         response = "00" + md.hexdigest()
-        self.talk(["/login", "=name=" + self.username, "=response=" + response])
+        try:
+            self.talk(["/login", "=name=" + self.username, "=response=" + response])
+            self._log("debug", "%s login ok (legacy)", self.host)
+        except RouterOSError:
+            raise RouterOSError("login failed (check username/password)")

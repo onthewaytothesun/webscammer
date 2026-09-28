@@ -37,7 +37,8 @@ from tkinter import (
 from tkinter import ttk
 
 import core
-from core import Device, backup_filename, dedupe_devices, expand_targets, parse_cli_to_api, poll_device
+from applog import setup_logging
+from core import Device, backup_filename, dedupe_devices, expand_targets, parse_cli_to_api
 from routeros_api import RouterOSApi, RouterOSError
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,9 @@ class ScannerApp:
         self.root = root
         self.root.title("MikroTik Scanner")
         self.root.geometry("1280x820")
+
+        # file logging for observability (logs/scanner-*.log next to program)
+        self.logger, self.log_path = setup_logging(APP_DIR)
 
         # runtime state
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -165,11 +169,19 @@ class ScannerApp:
         bottom.pack(fill=X)
         ttk.Entry(bottom, textvariable=self.var_find, width=30).pack(side=LEFT)
         ttk.Button(bottom, text="Find", command=self.on_find).pack(side=LEFT, padx=4)
+        ttk.Button(bottom, text="Save Log", command=self.on_save_log).pack(side=LEFT, padx=8)
+        ttk.Label(bottom, text=f"Log: logs/{os.path.basename(self.log_path)}",
+                  foreground="#666").pack(side=LEFT)
         ttk.Button(bottom, text="Export", command=self.on_export).pack(side=RIGHT, padx=2)
         ttk.Button(bottom, text="Import", command=self.on_import).pack(side=RIGHT, padx=2)
 
     # ------------------------------------------------------------- helpers
     def log(self, message: str) -> None:
+        # mirror every human-facing line into the log file too
+        try:
+            self.logger.info(message)
+        except Exception:  # noqa: BLE001
+            pass
         self.ui_queue.put(("log", message))
 
     def _write_log(self, message: str) -> None:
@@ -282,18 +294,21 @@ class ScannerApp:
             threads = max(1, int(self.var_threads.get()))
         except ValueError:
             threads = 20
-        use_ssl = self.var_cmdtype.get() == "API/SSL"
         try:
-            api_port = int(self.var_api_port.get())
+            api_ssl_port = int(self.var_api_port.get())
         except ValueError:
-            api_port = 8729 if use_ssl else 8728
+            api_ssl_port = 8729
+        try:
+            ssh_port = int(self.var_ssh_port.get() or 22)
+        except ValueError:
+            ssh_port = 22
         return {
             "user": self.var_user.get(),
             "password": self.var_pass.get(),
-            "api_port": api_port,
-            "ssh_port": int(self.var_ssh_port.get() or 22),
+            "api_ssl_port": api_ssl_port,
+            "ssh_port": ssh_port,
             "threads": threads,
-            "use_ssl": use_ssl,
+            "cmdtype": self.var_cmdtype.get(),
         }
 
     # ---------------------------------------------------------------- scan
@@ -333,7 +348,8 @@ class ScannerApp:
         self.btn_pause.configure(state="normal", text="Pause")
         self.btn_stop.configure(state="normal")
         self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
-                 f"{'API-SSL' if cfg['use_ssl'] else 'API'} port {cfg['api_port']}")
+                 f"API-SSL port {cfg['api_ssl_port']} (fallback plain API 8728). "
+                 f"Note: Command Type is used only by SEND, not by the scan.")
         self.worker = threading.Thread(
             target=self._scan_worker, args=(targets, cfg), daemon=True
         )
@@ -352,12 +368,13 @@ class ScannerApp:
             if self.stop_event.is_set():
                 return None
             try:
-                dev = poll_device(
+                dev = core.scan_host(
                     ip, cfg["user"], cfg["password"],
-                    cfg["api_port"], cfg["use_ssl"],
+                    cfg["api_ssl_port"], plain_port=8728, logger=self.logger,
                 )
                 dev.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.log(f"{ip}: found {dev.identity or dev.board_name or 'RouterOS'}")
+                self.log(f"{ip}: found {dev.identity or dev.board_name or 'RouterOS'} "
+                         f"[{dev.status}]")
             except Exception as exc:  # noqa: BLE001 - report every failure
                 dev = None
                 self.log(f"{ip}: {type(exc).__name__}: {exc}")
@@ -433,7 +450,7 @@ class ScannerApp:
 
     def _run_api_commands(self, dev: Device, command: str, cfg: dict) -> str:
         api = RouterOSApi(dev.ip, cfg["user"], cfg["password"],
-                          port=cfg["api_port"], use_ssl=cfg["use_ssl"])
+                          port=cfg["api_ssl_port"], use_ssl=True, logger=self.logger)
         api.connect()
         chunks = []
         try:
@@ -520,6 +537,24 @@ class ScannerApp:
                 self._upsert_device(dev)
                 count += 1
         self.log(f"Imported {count} row(s) from {path}")
+
+    def on_save_log(self) -> None:
+        import shutil
+        for handler in self.logger.handlers:
+            handler.flush()
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            initialfile=os.path.basename(self.log_path),
+            filetypes=[("Log", "*.log"), ("All files", "*.*")],
+            title="Save log for debugging",
+        )
+        if not dest:
+            return
+        try:
+            shutil.copyfile(self.log_path, dest)
+            messagebox.showinfo("Log", f"Лог сохранён:\n{dest}\n\nМожешь прислать этот файл для дебага.")
+        except OSError as exc:
+            messagebox.showerror("Log", f"Не удалось сохранить лог: {exc}")
 
     # ------------------------------------------------------------ settings
     def _maybe_save_settings(self) -> None:

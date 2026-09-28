@@ -173,13 +173,16 @@ def poll_device(
     port: int,
     use_ssl: bool,
     timeout: float = 8.0,
+    logger=None,
 ) -> Device:
     """Connect to one router and collect inventory fields.
 
     Raises on failure (connection refused, auth error, timeout).
     """
     dev = Device(ip=ip)
-    api = RouterOSApi(ip, username, password, port=port, use_ssl=use_ssl, timeout=timeout)
+    api = RouterOSApi(
+        ip, username, password, port=port, use_ssl=use_ssl, timeout=timeout, logger=logger
+    )
     api.connect()
     try:
         api.login()
@@ -231,6 +234,59 @@ def poll_device(
     finally:
         api.close()
     return dev
+
+
+# Errors that mean "we reached an open port but spoke the wrong transport" —
+# worth retrying with the other transport. Timeout / refused mean the port is
+# simply not there, so we do NOT waste time retrying those.
+def _worth_transport_fallback(exc: Exception) -> bool:
+    import ssl as _ssl
+
+    if isinstance(exc, _ssl.SSLError):
+        return True
+    if isinstance(exc, RouterOSError) and "connection closed" in str(exc).lower():
+        return True
+    if isinstance(exc, ConnectionResetError):
+        return True
+    return False
+
+
+def scan_host(
+    ip: str,
+    username: str,
+    password: str,
+    api_ssl_port: int,
+    plain_port: int = 8728,
+    timeout: float = 8.0,
+    logger=None,
+) -> Device:
+    """Poll one host over the RouterOS API.
+
+    Tries API-SSL (TLS) on api_ssl_port first; if that port is open but the
+    transport was wrong (TLS/plain mismatch), retries plain API on plain_port.
+    The Status field records which transport succeeded. Raises the last error
+    if nothing worked.
+    """
+    attempts = [(True, api_ssl_port, "API-SSL")]
+    if plain_port and plain_port != api_ssl_port:
+        attempts.append((False, plain_port, "API"))
+
+    last_exc: Exception = RouterOSError("no attempt made")
+    for i, (use_ssl, port, label) in enumerate(attempts):
+        try:
+            if logger:
+                logger.debug("%s: try %s on port %s", ip, label, port)
+            dev = poll_device(ip, username, password, port, use_ssl, timeout, logger=logger)
+            dev.status = f"OK ({label}:{port})"
+            return dev
+        except Exception as exc:  # noqa: BLE001 - decide whether to fall back
+            last_exc = exc
+            if logger:
+                logger.debug("%s: %s on port %s failed: %r", ip, label, port, exc)
+            more_attempts = i + 1 < len(attempts)
+            if not (more_attempts and _worth_transport_fallback(exc)):
+                break
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
