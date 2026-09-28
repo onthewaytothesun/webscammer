@@ -72,9 +72,11 @@ class ScannerApp:
         self.var_pass = StringVar()
         self.var_network = StringVar()
         self.var_api_port = StringVar(value="8729")
+        self.var_ssh_port = StringVar(value="22")
         self.var_threads = StringVar(value="30")
         self.var_timeout = StringVar(value="10")
         self.var_retries = StringVar(value="2")
+        self.var_cmdtype = StringVar(value="API/SSL")
         self.var_save = BooleanVar(value=False)
         self.var_find = StringVar()
 
@@ -98,9 +100,16 @@ class ScannerApp:
         field(form, "Password:", self.var_pass, 12, show="*")
         field(form, "Network:", self.var_network, 18)
         field(form, "API-SSL:", self.var_api_port, 6)
+        field(form, "SSH:", self.var_ssh_port, 6)
         field(form, "Threads:", self.var_threads, 5)
         field(form, "Timeout:", self.var_timeout, 4)
         field(form, "Retries:", self.var_retries, 3)
+        # how SEND and Backup talk to the router; the scan always uses the API
+        ttk.Label(form, text="Command Type:").pack(side=LEFT, padx=(6, 2))
+        ttk.Combobox(
+            form, textvariable=self.var_cmdtype, values=["API/SSL", "SSH"],
+            width=8, state="readonly",
+        ).pack(side=LEFT)
         ttk.Checkbutton(form, text="Save", variable=self.var_save).pack(side=LEFT, padx=(8, 2))
 
         # buttons row
@@ -310,6 +319,10 @@ class ScannerApp:
         except ValueError:
             api_ssl_port = 8729
         try:
+            ssh_port = int(self.var_ssh_port.get() or 22)
+        except ValueError:
+            ssh_port = 22
+        try:
             timeout = max(1.0, float(self.var_timeout.get()))
         except ValueError:
             timeout = 10.0
@@ -322,6 +335,8 @@ class ScannerApp:
             "password": self.var_pass.get(),
             "api_ssl_port": api_ssl_port,
             "threads": threads,
+            "ssh_port": ssh_port,
+            "cmdtype": self.var_cmdtype.get(),
             "timeout": timeout,
             "retries": retries,
         }
@@ -467,11 +482,20 @@ class ScannerApp:
         for dev in devices:
             iid = dev.key or dev.ip
             try:
-                out = self._run_api_commands(dev, command, cfg)
-                self.log(f"--- {dev.ip} ({dev.identity}) via {dev.reach_ip} ---\n{out}")
+                if cfg["cmdtype"] == "SSH":
+                    from ssh_client import run_ssh_command
+                    out = run_ssh_command(
+                        dev.reach_ip, cfg["user"], cfg["password"], command,
+                        port=cfg["ssh_port"], timeout=cfg["timeout"],
+                    )
+                else:
+                    out = self._run_api_commands(dev, command, cfg)
+                self.log(f"--- {dev.ip} ({dev.identity}) via {cfg['cmdtype']} "
+                         f"{dev.reach_ip} ---\n{out}")
                 self.ui_queue.put(("status", (iid, "Command OK")))
             except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip} (via {dev.reach_ip}): command failed: {type(exc).__name__}: {exc}")
+                self.log(f"{dev.ip} (via {cfg['cmdtype']} {dev.reach_ip}): command failed: "
+                         f"{type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Command error: {exc}")))
 
     def _run_api_commands(self, dev: Device, command: str, cfg: dict) -> str:
@@ -511,14 +535,21 @@ class ScannerApp:
         for dev in devices:
             iid = dev.key or dev.ip
             try:
-                api = core.open_device_api(
-                    dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
-                    timeout=cfg["timeout"], logger=self.logger,
-                )
-                try:
-                    text = core.fetch_export(api, logger=self.logger)
-                finally:
-                    api.close()
+                if cfg["cmdtype"] == "SSH":
+                    from ssh_client import export_config
+                    text = export_config(
+                        dev.reach_ip, cfg["user"], cfg["password"],
+                        port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0),
+                    )
+                else:
+                    api = core.open_device_api(
+                        dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+                        timeout=cfg["timeout"], logger=self.logger,
+                    )
+                    try:
+                        text = core.fetch_export(api, logger=self.logger)
+                    finally:
+                        api.close()
                 fname = backup_filename(dev.ip, dev.identity)
                 path = os.path.join(BACKUP_DIR, fname)
                 with open(path, "w", encoding="utf-8") as fh:
@@ -526,7 +557,8 @@ class ScannerApp:
                 self.log(f"{dev.ip}: backup saved -> Backups/{fname}")
                 self.ui_queue.put(("status", (iid, f"Backup: {fname}")))
             except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip} (via {dev.reach_ip}): backup failed: {type(exc).__name__}: {exc}")
+                self.log(f"{dev.ip} (via {cfg['cmdtype']} {dev.reach_ip}): backup failed: "
+                         f"{type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Backup error: {exc}")))
 
     # ---------------------------------------------------------- import/exp
@@ -608,6 +640,8 @@ class ScannerApp:
             "network": self.var_network.get(),
             "api_port": self.var_api_port.get(),
             "threads": self.var_threads.get(),
+            "ssh_port": self.var_ssh_port.get(),
+            "cmdtype": self.var_cmdtype.get(),
             "timeout": self.var_timeout.get(),
             "retries": self.var_retries.get(),
             "command": self.txt_command.get("1.0", END).rstrip(),
@@ -634,6 +668,8 @@ class ScannerApp:
         self.var_network.set(data.get("network", ""))
         self.var_api_port.set(data.get("api_port", "8729"))
         self.var_threads.set(data.get("threads", "30"))
+        self.var_ssh_port.set(data.get("ssh_port", "22"))
+        self.var_cmdtype.set(data.get("cmdtype", "API/SSL"))
         self.var_timeout.set(data.get("timeout", "10"))
         self.var_retries.set(data.get("retries", "2"))
         self.var_save.set(data.get("save", False))

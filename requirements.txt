@@ -1,2 +1,3 @@
-# No third-party dependencies: the scanner uses only the Python standard
-# library (tkinter, ssl, socket). This file is kept so `pip install -r` works.
+# Scan and API features use only the Python standard library.
+# paramiko is needed only for Command Type = SSH (SEND / Backup over SSH).
+paramiko>=3.0

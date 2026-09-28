@@ -514,7 +514,7 @@ def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
             if truncated:
                 raise RouterOSError(
                     "config is %s bytes but this RouterOS returns only %d over the API; "
-                    "upgrade to RouterOS 7.13+ to back it up via API"
+                    "switch Command Type to SSH (or upgrade to RouterOS 7.13+)"
                     % (size if size is not None else ">4K", got)
                 )
     finally:
