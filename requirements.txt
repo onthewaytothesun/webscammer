@@ -1,3 +1,2 @@
-# Core scanning + RouterOS API use only the Python standard library.
-# paramiko is required for SSH command dispatch and .rsc backups (/export).
-paramiko>=3.0
+# No third-party dependencies: the scanner uses only the Python standard
+# library (tkinter, ssl, socket). This file is kept so `pip install -r` works.

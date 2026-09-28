@@ -13,7 +13,6 @@ from core import (  # noqa: E402
     dedupe_devices,
     expand_targets,
     parse_cli_to_api,
-    parse_ssh_scan,
     _is_auth_failure,
 )
 from routeros_api import RouterOSApi, RouterOSError  # noqa: E402
@@ -102,39 +101,51 @@ def test_length_encoding_roundtrip_boundaries():
         assert isinstance(encoded, bytes) and len(encoded) >= 1
 
 
-def test_parse_ssh_scan():
-    out = (
-        "IDENTITY=V_Svobodi_65\n"
-        "BOARD=RB4011iGS+\n"
-        "VERSION=7.14.3 (stable)\n"
-        "SERIAL=HFX0ABC\n"
-        "MODEL=RB4011iGS+\n"
-        "LICENSE=5\n"
-        "BRIDGE=192.168.88.1/24\n"
-        "BRIDGE=192.168.99.1/24\n"
-    )
-    dev = parse_ssh_scan(out, "10.0.0.5")
-    assert dev.identity == "V_Svobodi_65"
-    assert dev.board_name == "RB4011iGS+"
-    assert dev.routeros == "7.14.3 (stable)"
-    assert dev.key == "HFX0ABC"
-    assert dev.license == "5"
-    assert dev.status == "OK (SSH)"
-    assert bridge_ip(dev.addresses) == "192.168.88.1"
-
-
-def test_parse_ssh_scan_falls_back_to_model_when_no_board():
-    out = "IDENTITY=CHR1\nBOARD=\nVERSION=7.14\nMODEL=CHR\n"
-    dev = parse_ssh_scan(out, "10.0.0.6")
-    assert dev.board_name == "CHR"
-
-
 def test_auth_failure_detection():
     # a rejected login is definitive -> caller must not retry or fall back
     assert _is_auth_failure(RouterOSError("login failed (check username/password)")) is True
     # a mid-session drop is NOT an auth failure -> caller should retry
     assert _is_auth_failure(RouterOSError("connection closed by router")) is False
     assert _is_auth_failure(TimeoutError()) is False
+
+
+class _FakeSock:
+    """Feeds a canned byte stream to RouterOSApi and swallows writes."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def sendall(self, _data) -> None:
+        pass
+
+    def recv(self, n: int) -> bytes:
+        chunk, self.data = self.data[:n], self.data[n:]
+        return chunk
+
+
+def _sentence(*words: str) -> bytes:
+    out = b""
+    for w in words:
+        b = w.encode()
+        out += RouterOSApi.encode_length(len(b)) + b
+    return out + b"\x00"
+
+
+def test_trap_consumes_its_done_so_next_reply_is_not_shifted():
+    api = RouterOSApi("x", "u", "p")
+    api.sock = _FakeSock(
+        _sentence("!trap", "=message=no such command")
+        + _sentence("!done")
+        + _sentence("!re", "=name=R1")
+        + _sentence("!done")
+    )
+    try:
+        api.talk(["/system/routerboard/print"])
+        raise AssertionError("trap not raised")
+    except RouterOSError as exc:
+        assert "no such command" in str(exc)
+    # the next command must get ITS reply, not the trap's leftover !done
+    assert api.talk(["/system/identity/print"]) == [{"name": "R1"}]
 
 
 def test_length_encoding_known_values():

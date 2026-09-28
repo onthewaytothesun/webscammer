@@ -34,6 +34,17 @@ class Device:
     # internal
     key: str = ""  # unique hardware key (serial) for de-duplication
     addresses: List[Dict[str, str]] = field(default_factory=list)
+    # How the scan actually reached the router. The table shows the bridge1
+    # address (`ip`), which may not be reachable from this PC, so Send/Backup
+    # connect through these instead.
+    connect_ip: str = ""
+    api_port: int = 0
+    api_ssl: bool = True
+    api_ciphers: Optional[str] = None
+
+    @property
+    def reach_ip(self) -> str:
+        return self.connect_ip or self.ip
 
     def as_row(self) -> Dict[str, str]:
         return {
@@ -267,6 +278,7 @@ def _try_plain_api(
             logger.debug("%s: API-SSL port refused, trying plain API on %s", ip, plain_port)
         dev = poll_device(ip, username, password, plain_port, False, timeout, logger=logger)
         dev.status = f"OK (API:{plain_port})"
+        dev.connect_ip, dev.api_port, dev.api_ssl = ip, plain_port, False
         return dev
     except Exception as exc:  # noqa: BLE001
         if logger:
@@ -318,6 +330,8 @@ def _poll_ssl_with_retries(
             dev = Device(ip=ip)
             _collect_fields(api, dev)
             dev.status = f"OK (API-SSL:{api_ssl_port})"
+            dev.connect_ip, dev.api_port = ip, api_ssl_port
+            dev.api_ssl, dev.api_ciphers = True, ciphers
             if logger:
                 logger.debug("%s: polled in %.1fs (attempt %d)",
                              ip, time.time() - started, attempt + 1)
@@ -383,51 +397,135 @@ def _backoff(logger, ip: str, attempt: int, exc: Exception) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SSH scan (alternative transport that avoids api-ssl TLS entirely)
+# Talking to an already-scanned device (Send / Backup)
 # ---------------------------------------------------------------------------
-# Each statement prints one labelled value, so the output needs no table
-# parsing. routerboard/license are guarded because CHR/x86 have no
-# routerboard. Sent as ONE line (";"-separated): a single-line exec is the
-# most portable form across RouterOS versions.
-SSH_SCAN_SCRIPT = "; ".join([
-    ':put ("IDENTITY=" . [:tostr [/system identity get name]])',
-    ':put ("BOARD=" . [:tostr [/system resource get board-name]])',
-    ':put ("VERSION=" . [:tostr [/system resource get version]])',
-    ':do { :put ("SERIAL=" . [:tostr [/system routerboard get serial-number]]) } on-error={}',
-    ':do { :put ("MODEL=" . [:tostr [/system routerboard get model]]) } on-error={}',
-    ':do { :put ("LICENSE=" . [:tostr [/system license get nlevel]]) } on-error={}',
-    ':foreach i in=[/ip address find where interface="bridge1"] '
-    'do={ :put ("BRIDGE=" . [:tostr [/ip address get $i address]]) }',
-])
+def open_device_api(
+    dev: Device, username: str, password: str,
+    default_port: int, timeout: float = 10.0, logger=None,
+) -> RouterOSApi:
+    """Connect + log in the same way the scan reached this device.
+
+    Uses the address/port/TLS/cipher recorded by the scan rather than the
+    bridge1 address shown in the table (that one may be unreachable).
+    Imported rows have no recorded transport, so they get API-SSL on
+    default_port.
+    """
+    api = RouterOSApi(
+        dev.reach_ip, username, password,
+        port=dev.api_port or default_port,
+        use_ssl=dev.api_ssl if dev.api_port else True,
+        timeout=timeout, logger=logger, ciphers=dev.api_ciphers,
+    )
+    api.connect()
+    try:
+        api.login()
+    except Exception:
+        api.close()
+        raise
+    return api
 
 
-def parse_ssh_scan(text: str, ip: str) -> Device:
-    """Parse the labelled output of SSH_SCAN_SCRIPT into a Device."""
-    dev = Device(ip=ip)
-    addrs: List[Dict[str, str]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key, val = key.strip(), val.strip()
-        if key == "IDENTITY":
-            dev.identity = val
-        elif key == "BOARD":
-            dev.board_name = val or dev.board_name
-        elif key == "VERSION":
-            dev.routeros = val
-        elif key == "SERIAL":
-            dev.key = val or dev.key
-        elif key == "MODEL" and not dev.board_name:
-            dev.board_name = val
-        elif key == "LICENSE":
-            dev.license = val
-        elif key == "BRIDGE" and val:
-            addrs.append({"address": val, "interface": BRIDGE_INTERFACE})
-    dev.addresses = addrs
-    dev.status = "OK (SSH)"
-    return dev
+# ---------------------------------------------------------------------------
+# Backup over the API: /export file=... then read the file back
+# ---------------------------------------------------------------------------
+EXPORT_BASENAME = "mtscan-export"
+# RouterOS 6 truncates `/file print contents` to this many bytes.
+_V6_CONTENTS_LIMIT = 4095
+_READ_CHUNK = 32768
+
+
+def _parse_size(value: str) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_export_file(api: RouterOSApi) -> Optional[Dict[str, str]]:
+    target = EXPORT_BASENAME + ".rsc"
+    for row in api.talk(["/file/print", "=.proplist=.id,name,size"]):
+        name = row.get("name", "")
+        # some boards keep files under flash/
+        if name == target or name.endswith("/" + target):
+            return row
+    return None
+
+
+def _read_file_chunks(api: RouterOSApi, name: str, size: Optional[int]) -> str:
+    """RouterOS 7.13+: /file/read returns the file in chunks of any size."""
+    parts: List[str] = []
+    offset = 0
+    while True:
+        rows = api.talk([
+            "/file/read", "=file=" + name,
+            "=offset=%d" % offset, "=chunk-size=%d" % _READ_CHUNK,
+        ])
+        data = "".join(r.get("data", "") for r in rows)
+        parts.append(data)
+        offset += len(data.encode("utf-8"))
+        if not data or len(data.encode("utf-8")) < _READ_CHUNK:
+            break
+        if size is not None and offset >= size:
+            break
+    return "".join(parts)
+
+
+def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
+    """Return the router's /export (.rsc text) using only the API.
+
+    Writes the export to a temporary file on the router, reads it back
+    (/file/read on 7.13+, `contents` otherwise) and deletes the file. On
+    RouterOS 6 `contents` is capped at ~4 KB, so a larger config raises a
+    clear error instead of saving a truncated backup.
+    """
+    api.talk(["/export", "=file=" + EXPORT_BASENAME])
+
+    # the file can take a moment to appear on slow flash
+    info = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info = _find_export_file(api)
+        if info is not None:
+            break
+        time.sleep(0.5)
+    if info is None:
+        raise RouterOSError("export file did not appear on the router")
+
+    name = info.get("name", EXPORT_BASENAME + ".rsc")
+    size = _parse_size(info.get("size", ""))
+    try:
+        try:
+            text = _read_file_chunks(api, name, size)
+        except RouterOSError as exc:
+            # /file/read does not exist before RouterOS 7.13
+            if logger:
+                logger.debug("%s: /file/read unavailable (%s), using contents", api.host, exc)
+            text = ""
+        if text.strip():
+            if logger:
+                logger.debug("%s: export read via /file/read (%d bytes)", api.host, len(text))
+        else:
+            rows = api.talk(["/file/print", "?name=" + name, "=.proplist=contents,size"])
+            text = rows[0].get("contents", "") if rows else ""
+            got = len(text.encode("utf-8"))
+            truncated = (size is not None and got < size) or (
+                size is None and got >= _V6_CONTENTS_LIMIT
+            )
+            if truncated:
+                raise RouterOSError(
+                    "config is %s bytes but this RouterOS returns only %d over the API; "
+                    "upgrade to RouterOS 7.13+ to back it up via API"
+                    % (size if size is not None else ">4K", got)
+                )
+    finally:
+        try:
+            api.talk(["/file/remove", "=numbers=" + info.get(".id", name)])
+        except RouterOSError:
+            pass  # cleanup is best effort
+
+    if not text.strip():
+        raise RouterOSError("export came back empty")
+    return text.replace("\r\n", "\n")
 
 
 # ---------------------------------------------------------------------------

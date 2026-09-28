@@ -207,6 +207,7 @@ class RouterOSApi:
         """
         self._write_sentence(words)
         replies: List[Dict[str, str]] = []
+        trap: Optional[str] = None
         while True:
             sentence = self._read_sentence()
             if not sentence:
@@ -219,12 +220,21 @@ class RouterOSApi:
                     attrs[key] = val
             if reply_type == "!re":
                 replies.append(attrs)
+            elif reply_type == "!trap":
+                # RouterOS always follows !trap with !done. Keep reading up to
+                # it, otherwise that !done is taken as the reply to the NEXT
+                # command and every later reply is shifted by one.
+                if trap is None:
+                    trap = attrs.get("message", "; ".join(sentence))
             elif reply_type == "!done":
+                if trap is not None:
+                    raise RouterOSError(trap)
                 if attrs:
                     replies.append(attrs)
                 return replies
-            elif reply_type == "!trap" or reply_type == "!fatal":
-                raise RouterOSError(attrs.get("message", "; ".join(sentence)))
+            elif reply_type == "!fatal":
+                # the router closes the connection after !fatal
+                raise RouterOSError(attrs.get("message", "; ".join(sentence[1:])) or "fatal")
 
     # -- login ------------------------------------------------------------
     def login(self) -> None:

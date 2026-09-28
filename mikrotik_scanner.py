@@ -4,7 +4,7 @@ MikroTik subnet scanner & manager.
 
 A Tkinter desktop tool that scans a subnet for MikroTik / RouterOS devices,
 authenticates with operator-supplied credentials over the RouterOS API
-(plain or API-SSL) or SSH, inventories them, runs commands on selected
+(API-SSL, with plain API as a fallback), inventories them, runs commands on selected
 devices, and saves textual (.rsc) backups.
 
 Run:  python3 mikrotik_scanner.py
@@ -39,7 +39,6 @@ from tkinter import ttk
 import core
 from applog import setup_logging
 from core import Device, backup_filename, dedupe_devices, expand_targets, parse_cli_to_api
-from routeros_api import RouterOSApi, RouterOSError
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -73,12 +72,9 @@ class ScannerApp:
         self.var_pass = StringVar()
         self.var_network = StringVar()
         self.var_api_port = StringVar(value="8729")
-        self.var_ssh_port = StringVar(value="22")
         self.var_threads = StringVar(value="30")
         self.var_timeout = StringVar(value="10")
         self.var_retries = StringVar(value="2")
-        self.var_scanvia = StringVar(value="SSH")
-        self.var_cmdtype = StringVar(value="API/SSL")
         self.var_save = BooleanVar(value=False)
         self.var_find = StringVar()
 
@@ -102,23 +98,9 @@ class ScannerApp:
         field(form, "Password:", self.var_pass, 12, show="*")
         field(form, "Network:", self.var_network, 18)
         field(form, "API-SSL:", self.var_api_port, 6)
-        field(form, "SSH:", self.var_ssh_port, 5)
         field(form, "Threads:", self.var_threads, 5)
         field(form, "Timeout:", self.var_timeout, 4)
         field(form, "Retries:", self.var_retries, 3)
-        ttk.Label(form, text="Scan via:").pack(side=LEFT, padx=(6, 2))
-        ttk.Combobox(
-            form, textvariable=self.var_scanvia, values=["API-SSL", "SSH"],
-            width=8, state="readonly",
-        ).pack(side=LEFT)
-        ttk.Label(form, text="Command Type:").pack(side=LEFT, padx=(6, 2))
-        ttk.Combobox(
-            form,
-            textvariable=self.var_cmdtype,
-            values=["API/SSL", "SSH"],
-            width=8,
-            state="readonly",
-        ).pack(side=LEFT)
         ttk.Checkbutton(form, text="Save", variable=self.var_save).pack(side=LEFT, padx=(8, 2))
 
         # buttons row
@@ -220,7 +202,7 @@ class ScannerApp:
                 elif kind == "status_ip":
                     ip, text = payload
                     for iid, dev in self.devices.items():
-                        if dev.ip == ip and self.tree.exists(iid):
+                        if ip in (dev.ip, dev.reach_ip) and self.tree.exists(iid):
                             dev.status = text
                             self.tree.set(iid, "Status", text)
                 elif kind == "done":
@@ -328,10 +310,6 @@ class ScannerApp:
         except ValueError:
             api_ssl_port = 8729
         try:
-            ssh_port = int(self.var_ssh_port.get() or 22)
-        except ValueError:
-            ssh_port = 22
-        try:
             timeout = max(1.0, float(self.var_timeout.get()))
         except ValueError:
             timeout = 10.0
@@ -343,12 +321,9 @@ class ScannerApp:
             "user": self.var_user.get(),
             "password": self.var_pass.get(),
             "api_ssl_port": api_ssl_port,
-            "ssh_port": ssh_port,
             "threads": threads,
             "timeout": timeout,
             "retries": retries,
-            "scanvia": self.var_scanvia.get(),
-            "cmdtype": self.var_cmdtype.get(),
         }
 
     # ---------------------------------------------------------------- scan
@@ -378,7 +353,7 @@ class ScannerApp:
         subnet = self._targets_or_warn()
         if subnet is None:
             return
-        targets = set(dev.ip for dev in self.devices.values())
+        targets = set(dev.reach_ip for dev in self.devices.values())
         targets.update(subnet)
         if not targets:
             messagebox.showinfo("Update", "Nothing to update yet — run a scan first.")
@@ -400,15 +375,9 @@ class ScannerApp:
         cfg = self._read_config()
         self.btn_pause.configure(state="normal", text="Pause")
         self.btn_stop.configure(state="normal")
-        if cfg["scanvia"] == "SSH":
-            self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
-                     f"timeout {cfg['timeout']}s, via SSH port {cfg['ssh_port']}. "
-                     f"Note: Command Type is used only by SEND, not by the scan.")
-        else:
-            self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
-                     f"timeout {cfg['timeout']}s, {cfg['retries']} retries, "
-                     f"API-SSL port {cfg['api_ssl_port']} (plain-API fallback only if 8729 refused). "
-                     f"Note: Command Type is used only by SEND, not by the scan.")
+        self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
+                 f"timeout {cfg['timeout']}s, {cfg['retries']} retries, "
+                 f"API-SSL port {cfg['api_ssl_port']} (plain API 8728 only if that port is refused).")
         self.worker = threading.Thread(
             target=self._scan_worker, args=(targets, cfg), daemon=True
         )
@@ -427,19 +396,12 @@ class ScannerApp:
             if self.stop_event.is_set():
                 return None
             try:
-                if cfg["scanvia"] == "SSH":
-                    from ssh_client import ssh_scan_host
-                    dev = ssh_scan_host(
-                        ip, cfg["user"], cfg["password"],
-                        port=cfg["ssh_port"], timeout=cfg["timeout"], logger=self.logger,
-                    )
-                else:
-                    dev = core.scan_host(
-                        ip, cfg["user"], cfg["password"],
-                        cfg["api_ssl_port"], plain_port=8728,
-                        timeout=cfg["timeout"], retries=cfg["retries"],
-                        logger=self.logger,
-                    )
+                dev = core.scan_host(
+                    ip, cfg["user"], cfg["password"],
+                    cfg["api_ssl_port"], plain_port=8728,
+                    timeout=cfg["timeout"], retries=cfg["retries"],
+                    logger=self.logger,
+                )
                 dev.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.log(f"{ip}: found {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
@@ -496,37 +458,29 @@ class ScannerApp:
             messagebox.showinfo("Send", "Type a command in the Command tab.")
             return
         cfg = self._read_config()
-        cmdtype = self.var_cmdtype.get()
         self.notebook.select(1)  # show output tab
         threading.Thread(
-            target=self._send_worker, args=(devices, command, cmdtype, cfg), daemon=True
+            target=self._send_worker, args=(devices, command, cfg), daemon=True
         ).start()
 
-    def _send_worker(self, devices, command, cmdtype, cfg) -> None:
+    def _send_worker(self, devices, command, cfg) -> None:
         for dev in devices:
             iid = dev.key or dev.ip
             try:
-                if cmdtype == "SSH":
-                    from ssh_client import run_ssh_command
-                    out = run_ssh_command(
-                        dev.ip, cfg["user"], cfg["password"], command, port=cfg["ssh_port"]
-                    )
-                else:
-                    out = self._run_api_commands(dev, command, cfg)
-                self.log(f"--- {dev.ip} ({dev.identity}) ---\n{out}")
+                out = self._run_api_commands(dev, command, cfg)
+                self.log(f"--- {dev.ip} ({dev.identity}) via {dev.reach_ip} ---\n{out}")
                 self.ui_queue.put(("status", (iid, "Command OK")))
             except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip}: command failed: {exc}")
+                self.log(f"{dev.ip} (via {dev.reach_ip}): command failed: {type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Command error: {exc}")))
 
     def _run_api_commands(self, dev: Device, command: str, cfg: dict) -> str:
-        api = RouterOSApi(dev.ip, cfg["user"], cfg["password"],
-                          port=cfg["api_ssl_port"], use_ssl=True,
-                          timeout=cfg["timeout"], logger=self.logger)
-        api.connect()
+        api = core.open_device_api(
+            dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+            timeout=cfg["timeout"], logger=self.logger,
+        )
         chunks = []
         try:
-            api.login()
             for line in command.splitlines():
                 if not line.strip():
                     continue
@@ -557,8 +511,14 @@ class ScannerApp:
         for dev in devices:
             iid = dev.key or dev.ip
             try:
-                from ssh_client import export_config
-                text = export_config(dev.ip, cfg["user"], cfg["password"], port=cfg["ssh_port"])
+                api = core.open_device_api(
+                    dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+                    timeout=cfg["timeout"], logger=self.logger,
+                )
+                try:
+                    text = core.fetch_export(api, logger=self.logger)
+                finally:
+                    api.close()
                 fname = backup_filename(dev.ip, dev.identity)
                 path = os.path.join(BACKUP_DIR, fname)
                 with open(path, "w", encoding="utf-8") as fh:
@@ -566,7 +526,7 @@ class ScannerApp:
                 self.log(f"{dev.ip}: backup saved -> Backups/{fname}")
                 self.ui_queue.put(("status", (iid, f"Backup: {fname}")))
             except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip}: backup failed: {exc}")
+                self.log(f"{dev.ip} (via {dev.reach_ip}): backup failed: {type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Backup error: {exc}")))
 
     # ---------------------------------------------------------- import/exp
@@ -580,10 +540,12 @@ class ScannerApp:
         if not path:
             return
         with open(path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=COLUMNS)
+            # "Mgmt IP" = the address the router actually answers on, so an
+            # imported list can still be backed up / sent commands
+            writer = csv.DictWriter(fh, fieldnames=COLUMNS + ("Mgmt IP",))
             writer.writeheader()
             for dev in self.devices.values():
-                writer.writerow(dev.as_row())
+                writer.writerow({**dev.as_row(), "Mgmt IP": dev.reach_ip})
         self.log(f"Exported {len(self.devices)} row(s) -> {path}")
 
     def on_import(self) -> None:
@@ -605,6 +567,7 @@ class ScannerApp:
                     last_seen=row.get("Last seen", ""),
                     status=row.get("Status", ""),
                     key=row.get("IP", ""),
+                    connect_ip=row.get("Mgmt IP", "") or "",
                 )
                 self._upsert_device(dev)
                 count += 1
@@ -644,12 +607,9 @@ class ScannerApp:
             "user": self.var_user.get(),
             "network": self.var_network.get(),
             "api_port": self.var_api_port.get(),
-            "ssh_port": self.var_ssh_port.get(),
             "threads": self.var_threads.get(),
             "timeout": self.var_timeout.get(),
             "retries": self.var_retries.get(),
-            "scanvia": self.var_scanvia.get(),
-            "cmdtype": self.var_cmdtype.get(),
             "command": self.txt_command.get("1.0", END).rstrip(),
             "save": True,
         }
@@ -673,12 +633,9 @@ class ScannerApp:
         self.var_user.set(data.get("user", ""))
         self.var_network.set(data.get("network", ""))
         self.var_api_port.set(data.get("api_port", "8729"))
-        self.var_ssh_port.set(data.get("ssh_port", "22"))
         self.var_threads.set(data.get("threads", "30"))
         self.var_timeout.set(data.get("timeout", "10"))
         self.var_retries.set(data.get("retries", "2"))
-        self.var_scanvia.set(data.get("scanvia", "SSH"))
-        self.var_cmdtype.set(data.get("cmdtype", "API/SSL"))
         self.var_save.set(data.get("save", False))
         if data.get("password"):
             try:
