@@ -13,7 +13,6 @@
     Username: admin   (пароль любой)
     Network:  127.0.0.1
     API-SSL:  8728        (обычный API без шифрования)
-    Command Type: любой; для скана порт берётся из поля API-SSL
     New Scan
 """
 
