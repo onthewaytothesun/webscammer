@@ -41,19 +41,22 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 import core
+import icons
 from applog import setup_logging
 from core import Device, backup_filename, dedupe_devices, expand_targets, parse_cli_to_api
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 DEVICES_FILE = os.path.join(APP_DIR, "devices.json")  # cached scan results
+UI_FILE = os.path.join(APP_DIR, "ui.json")  # user-set column widths
 BACKUP_DIR = os.path.join(APP_DIR, "Backups")
 CSV_DELIMITER = ";"  # Excel-friendly in RU locale; "Mgmt IP" is the reach address
 
-COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last seen", "Status")
-CHECK_ON = "☑"
-CHECK_OFF = "☐"
-UPDATE_GLYPH = "⟳"  # per-row refresh button
+COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last seen", "Last Backup", "Status")
+# default column widths, in characters of the current font (so they fit any font/DPI)
+DEFAULT_CHARS = {"IP": 14, "Identity": 20, "Board Name": 13, "RouterOS": 11, "License": 7,
+                 "Last seen": 19, "Last Backup": 19, "Status": 20, "winbox": 8}
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 WINBOX_LABEL = "▶ Winbox"  # per-row launcher, last column
 
 
@@ -74,6 +77,7 @@ class ScannerApp:
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.sort_state: dict[str, bool] = {}
+        self._resizing_columns = False
 
         # form variables
         self.var_user = StringVar()
@@ -92,18 +96,47 @@ class ScannerApp:
         self._build_ui()
         self._load_settings()
         self._load_devices()
-        self.root.after(100, self._drain_queue)
+        self._after_id = self.root.after(100, self._drain_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        # bigger table rows so the check / update glyphs are easy to hit
+        # The table text keeps the default font. A ttk table can't size one cell's
+        # font, so the checkbox and the update button are drawn as images, a bit
+        # larger than the text.
         style = ttk.Style(self.root)
-        base = tkfont.nametofont("TkDefaultFont")
-        self._tree_font = base.copy()  # keep a reference or Tk drops it
-        self._tree_font.configure(size=abs(base.cget("size")) + 2)
-        style.configure("Treeview", font=self._tree_font,
-                        rowheight=int(self._tree_font.metrics("linespace") * 1.8))
+        linespace = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        self._icon_size = max(16, round(linespace * 1.25))
+        self._icon_gap, self._icon_w, self._refresh_x = icons.layout(self._icon_size)
+        self._icons = {}  # PhotoImages must stay referenced or Tk drops them
+        for checked in (False, True):
+            self._icons[("row", checked)] = tk.PhotoImage(
+                data=icons.row_icon(self._icon_size, checked)[2])
+            self._icons[("head", checked)] = tk.PhotoImage(
+                data=icons.header_icon(self._icon_size, checked)[2])
+        try:
+            base_height = int(style.lookup("Treeview", "rowheight") or 0)
+        except ValueError:
+            base_height = 0
+        style.configure("Treeview", rowheight=max(base_height, linespace + 4, self._icon_size + 6))
+        try:
+            # no expand/collapse indicator space: the icons start at the cell edge
+            style.layout("Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+                ("Treeitem.image", {"side": "left", "sticky": ""}),
+                ("Treeitem.focus", {"side": "left", "sticky": "", "children": [
+                    ("Treeitem.text", {"side": "left", "sticky": ""})]}),
+            ]})])
+            # ttk puts a heading's image on the right by default; keep it on the left
+            style.layout("Treeview.Heading", [
+                ("Treeheading.cell", {"sticky": "nswe"}),
+                ("Treeheading.border", {"sticky": "nswe", "children": [
+                    ("Treeheading.padding", {"sticky": "nswe", "children": [
+                        ("Treeheading.image", {"side": "left", "sticky": ""}),
+                        ("Treeheading.text", {"sticky": "we"}),
+                    ]})]}),
+            ])
+        except tk.TclError:
+            pass
         # copy/paste for entries and log, independent of keyboard layout
         self._install_clipboard_bindings()
 
@@ -173,24 +206,30 @@ class ScannerApp:
         # table
         table_frame = ttk.Frame(self.root)
         table_frame.pack(fill=BOTH, expand=True, padx=6, pady=2)
-        cols = ("check", "upd") + COLUMNS + ("winbox",)
-        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="none")
-        self.tree.heading("check", text=CHECK_OFF, command=self.toggle_all)
-        self.tree.column("check", width=46, anchor="center", stretch=False)
-        self.tree.heading("upd", text=UPDATE_GLYPH)
-        self.tree.column("upd", width=40, anchor="center", stretch=False)
+        cols = COLUMNS + ("winbox",)
+        self._winbox_col = "#%d" % (len(COLUMNS) + 1)
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="tree headings", selectmode="none")
+        # column #0 holds the checkbox + update button images
+        self.tree.heading("#0", image=self._icons[("head", False)], anchor="w",
+                          command=self.toggle_all)
+        self.tree.column("#0", width=self._icon_w + 14, minwidth=self._icon_w + 6,
+                         anchor="w", stretch=False)
         for col in COLUMNS:
             self.tree.heading(col, text=col, command=lambda c=col: self.sort_by(c))
-            self.tree.column(col, width=150, anchor="w")
+            self.tree.column(col, width=self._default_width(col), anchor="w", stretch=False)
         self.tree.heading("winbox", text="Winbox")
-        self.tree.column("winbox", width=90, anchor="center", stretch=False)
-        self.tree.column("IP", width=120)
-        self.tree.column("Status", width=220)
+        self.tree.column("winbox", width=self._default_width("winbox"), anchor="center", stretch=False)
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         vsb.pack(side=RIGHT, fill=Y)
+        hsb.pack(side="bottom", fill=X)
         self.tree.pack(fill=BOTH, expand=True)
         self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
+        for seq in self._right_click_sequences():
+            self.tree.bind(seq, self._on_tree_right_click)
+        self._load_ui_state()
 
         # bottom bar
         bottom = ttk.Frame(self.root, padding=6)
@@ -254,6 +293,11 @@ class ScannerApp:
         except Exception:  # noqa: BLE001
             pass
 
+    def _right_click_sequences(self) -> tuple:
+        if self.root.tk.call("tk", "windowingsystem") == "aqua":
+            return ("<Button-2>", "<Control-Button-1>")
+        return ("<Button-3>",)
+
     def _attach_context_menu(self, widget, readonly: bool = False) -> None:
         menu = tk.Menu(widget, tearoff=0)
         menu.add_command(label="Копировать", command=lambda: self._safe_event(widget, "<<Copy>>"))
@@ -270,7 +314,8 @@ class ScannerApp:
             finally:
                 menu.grab_release()
 
-        widget.bind("<Button-3>", popup)
+        for seq in self._right_click_sequences():
+            widget.bind(seq, popup)
 
     def _make_readonly(self, text) -> None:
         """Let the user select and copy from a Text but not change it."""
@@ -320,7 +365,7 @@ class ScannerApp:
                 except Exception:  # noqa: BLE001 - keep the UI loop alive
                     self.logger.exception("UI message %r failed", kind)
         finally:
-            self.root.after(100, self._drain_queue)
+            self._after_id = self.root.after(100, self._drain_queue)
 
     def _handle_ui_message(self, kind: str, payload) -> None:
         if kind == "log":
@@ -342,51 +387,144 @@ class ScannerApp:
                 if ip in (dev.ip, dev.reach_ip) and self.tree.exists(iid):
                     dev.status = text
                     self.tree.set(iid, "Status", text)
+        elif kind == "row":
+            dev = self.devices.get(payload)
+            if dev is not None and self.tree.exists(payload):
+                self.tree.item(payload, values=self._row_values(dev))
         elif kind == "save_devices":
             self._save_devices()
         elif kind == "done":
             self._scan_finished(payload)
 
+    def _default_width(self, column: str) -> int:
+        font = tkfont.nametofont("TkDefaultFont")
+        return font.measure("0" * DEFAULT_CHARS[column]) + 22
+
+    def _row_values(self, dev: Device) -> tuple:
+        row = dev.as_row()
+        return tuple(row[c] for c in COLUMNS) + (WINBOX_LABEL,)
+
+    def _row_image(self, iid: str):
+        return self._icons[("row", iid in self.checked)]
+
+    def _sync_header(self) -> None:
+        """Header box is ticked only while every row is."""
+        every = bool(self.devices) and all(i in self.checked for i in self.devices)
+        self.tree.heading("#0", image=self._icons[("head", every)])
+
     def _upsert_device(self, dev: Device) -> None:
         iid = dev.key or dev.ip
         # A row for this IP may exist under another id (imported rows are
         # keyed by IP, scanned ones by serial): replace it, keep its checkbox.
-        for other in [i for i, d in self.devices.items() if d.ip == dev.ip and i != iid]:
+        stale = [i for i, d in self.devices.items() if d.ip == dev.ip and i != iid]
+        if not dev.last_backup:
+            # a rescan builds a fresh Device that knows nothing about backups
+            previous = [self.devices.get(iid)] + [self.devices[i] for i in stale]
+            dev.last_backup = next((p.last_backup for p in previous if p and p.last_backup), "")
+        for other in stale:
             if other in self.checked:
                 self.checked.discard(other)
                 self.checked.add(iid)
             if self.tree.exists(other):
                 self.tree.delete(other)
             del self.devices[other]
-        values = (CHECK_ON if iid in self.checked else CHECK_OFF, UPDATE_GLYPH) + tuple(
-            dev.as_row()[c] for c in COLUMNS
-        ) + (WINBOX_LABEL,)
+        values = self._row_values(dev)
         if self.tree.exists(iid):
-            self.tree.item(iid, values=values)
+            self.tree.item(iid, values=values, image=self._row_image(iid))
         else:
-            self.tree.insert("", END, iid=iid, values=values)
+            self.tree.insert("", END, iid=iid, values=values, image=self._row_image(iid))
         self.devices[iid] = dev
 
     # --------------------------------------------------------- table logic
     def _on_tree_click(self, event) -> None:
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
+        # remember a column-border drag so its new width is saved on release
+        self._resizing_columns = self.tree.identify_region(event.x, event.y) == "separator"
+        if event.state & 0x4:  # Ctrl-click is the right click on macOS
             return
-        col = self.tree.identify_column(event.x)
+        if self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
+            return
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        if col == "#1":  # checkbox column
-            if iid in self.checked:
-                self.checked.discard(iid)
-                self.tree.set(iid, "check", CHECK_OFF)
-            else:
-                self.checked.add(iid)
-                self.tree.set(iid, "check", CHECK_ON)
-        elif col == "#2":  # per-row update button
-            self.on_update_one(iid)
-        elif col == "#%d" % (len(COLUMNS) + 3):  # last column: Winbox launcher
+        col = self.tree.identify_column(event.x)
+        if col == "#0":
+            box = self.tree.bbox(iid, "#0")
+            if not box:
+                return
+            rel = event.x - box[0]  # x inside the cell; image = checkbox, gap, update button
+            if rel < self._icon_size + self._icon_gap // 2 + 3:
+                if iid in self.checked:
+                    self.checked.discard(iid)
+                else:
+                    self.checked.add(iid)
+                self.tree.item(iid, image=self._row_image(iid))
+                self._sync_header()
+            elif rel < self._icon_w + 10:
+                self.on_update_one(iid)
+        elif col == self._winbox_col:
             self.on_winbox(iid)
+
+    def _on_tree_release(self, _event) -> None:
+        if self._resizing_columns:
+            self._resizing_columns = False
+            self._save_ui_state()
+
+    # ------------------------------------------ copy from the table (right click)
+    def _copy_text(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _on_tree_right_click(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
+            return
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        col_id = self.tree.identify_column(event.x)
+        names = self.tree.cget("columns")
+        index = int(col_id[1:]) - 1 if col_id != "#0" else -1
+        name = names[index] if 0 <= index < len(COLUMNS) else None  # data cells only
+        row_text = "\t".join(self.tree.set(iid, c) for c in COLUMNS)  # tabs paste into Excel columns
+        menu = tk.Menu(self.tree, tearoff=0)
+        if name:
+            value = self.tree.set(iid, name)
+            shown = value if len(value) <= 32 else value[:31] + "…"
+            menu.add_command(label=f"Копировать ячейку: {shown}" if value else "Копировать ячейку (пусто)",
+                             state="normal" if value else "disabled",
+                             command=lambda: self._copy_text(value))
+        menu.add_command(label="Копировать строку", command=lambda: self._copy_text(row_text))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ------------------------------------------------ remembered column widths
+    def _save_ui_state(self) -> None:
+        widths = {name: int(self.tree.column(name, "width"))
+                  for name in ("#0",) + tuple(self.tree.cget("columns"))}
+        try:
+            tmp = UI_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"column_widths": widths}, fh, indent=1)
+            os.replace(tmp, UI_FILE)
+        except OSError as exc:
+            self.logger.warning("could not save column widths: %s", exc)
+
+    def _load_ui_state(self) -> None:
+        try:
+            with open(UI_FILE, encoding="utf-8") as fh:
+                widths = json.load(fh).get("column_widths", {})
+        except (OSError, ValueError, AttributeError):
+            return
+        known = ("#0",) + tuple(self.tree.cget("columns"))
+        for name, width in (widths.items() if isinstance(widths, dict) else []):
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                continue
+            if name in known:
+                minimum = int(self.tree.column(name, "minwidth"))
+                self.tree.column(name, width=max(minimum, min(width, 2000)))
 
     def _find_winbox(self):
         """winbox.exe (any winbox*.exe) sitting next to the program."""
@@ -458,16 +596,11 @@ class ScannerApp:
 
     def toggle_all(self) -> None:
         all_iids = self.tree.get_children("")
-        if self.checked >= set(all_iids) and all_iids:
-            self.checked.clear()
-            new = CHECK_OFF
-            self.tree.heading("check", text=CHECK_OFF)
-        else:
-            self.checked = set(all_iids)
-            new = CHECK_ON
-            self.tree.heading("check", text=CHECK_ON)
+        select = not (all_iids and self.checked >= set(all_iids))
+        self.checked = set(all_iids) if select else set()
         for iid in all_iids:
-            self.tree.set(iid, "check", new)
+            self.tree.item(iid, image=self._row_image(iid))
+        self._sync_header()
 
     def sort_by(self, column: str) -> None:
         reverse = self.sort_state.get(column, False)
@@ -568,7 +701,7 @@ class ScannerApp:
             self.tree.delete(iid)
         self.devices.clear()
         self.checked.clear()
-        self.tree.heading("check", text=CHECK_OFF)
+        self._sync_header()
         self._start_scan(targets, "New scan")
 
     def on_update(self) -> None:
@@ -657,6 +790,8 @@ class ScannerApp:
         self.btn_pause.configure(state="disabled", text="Pause")
         self.btn_stop.configure(state="disabled")
         self._write_log(f"Scan complete: {len(deduped)} unique device(s).")
+        self._seed_last_backup()
+        self._sync_header()
         self._save_devices()  # cache results so a restart doesn't require rescanning
 
     def on_pause(self) -> None:
@@ -772,8 +907,11 @@ class ScannerApp:
                 path = os.path.join(BACKUP_DIR, fname)
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(text + "\n")
+                dev.last_backup = datetime.now().strftime(TIME_FORMAT)
                 self.log(f"{dev.ip}: backup saved -> Backups/{fname}")
                 self.ui_queue.put(("status", (iid, f"Backup: {fname}")))
+                self.ui_queue.put(("row", iid))  # shows the new Last Backup time
+                self.ui_queue.put(("save_devices", None))
             except Exception as exc:  # noqa: BLE001
                 self.log(f"{dev.ip} (via {self._via(dev, cfg)}): backup failed: "
                          f"{type(exc).__name__}: {exc}")
@@ -845,16 +983,32 @@ class ScannerApp:
                     routeros=row.get("RouterOS", ""),
                     license=row.get("License", ""),
                     last_seen=row.get("Last seen", ""),
+                    last_backup=row.get("Last Backup", "") or "",
                     status=row.get("Status", ""),
                     key=row.get("IP", ""),
                     connect_ip=row.get("Mgmt IP", "") or "",
                 )
                 self._upsert_device(dev)
                 count += 1
+        self._seed_last_backup()
+        self._sync_header()
         self._save_devices()
         self.log(f"Imported {count} row(s) from {path}")
 
     # ------------------------------------------------- cached scan results
+    def _seed_last_backup(self) -> None:
+        """Backups made before this column existed carry no timestamp; take it
+        from the newest matching file in Backups/."""
+        missing = [(i, d) for i, d in self.devices.items() if not d.last_backup]
+        if not missing:
+            return
+        index = core.backup_index(BACKUP_DIR)
+        for iid, dev in missing:
+            stamp = index.get(dev.ip)
+            if stamp:
+                dev.last_backup = stamp
+                self.tree.set(iid, "Last Backup", stamp)
+
     def _save_devices(self) -> None:
         try:
             rows = [dataclasses.asdict(d) for d in self.devices.values()]
@@ -882,6 +1036,8 @@ class ScannerApp:
                 loaded += 1
             except (TypeError, AttributeError):
                 continue  # skip a malformed entry, keep the rest
+        self._seed_last_backup()
+        self._sync_header()
         if loaded:
             self._write_log(f"Loaded {loaded} cached device(s) from last session. "
                             f"Use Update to refresh, New Scan to start over.")
@@ -972,8 +1128,13 @@ class ScannerApp:
 
     def _on_close(self) -> None:
         self.stop_event.set()
+        try:
+            self.root.after_cancel(self._after_id)
+        except (tk.TclError, AttributeError):
+            pass
         self._maybe_save_settings()
         self._save_devices()  # persist statuses (backups/commands) too
+        self._save_ui_state()
         self.root.destroy()
 
 

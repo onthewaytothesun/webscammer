@@ -9,12 +9,13 @@ Kept free of tkinter so it can be unit tested headlessly.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import shlex
 import ssl
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, List, Optional
 
 from routeros_api import RouterOSApi, RouterOSError
@@ -30,6 +31,7 @@ class Device:
     routeros: str = ""
     license: str = ""
     last_seen: str = ""
+    last_backup: str = ""
     status: str = ""
     # internal
     key: str = ""  # unique hardware key (serial) for de-duplication
@@ -54,6 +56,7 @@ class Device:
             "RouterOS": self.routeros,
             "License": self.license,
             "Last seen": self.last_seen,
+            "Last Backup": self.last_backup,
             "Status": self.status,
         }
 
@@ -537,6 +540,30 @@ def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
 def sanitize(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
     return cleaned or "unknown"
+
+
+def backup_index(backup_dir: str) -> Dict[str, str]:
+    """Newest backup time per IP, read from the files in the Backups folder.
+
+    Files are named IP_Identity_YYYY-MM-DD.rsc; the time comes from the file's
+    modification time. Used for backups made before the app recorded them.
+    """
+    newest: Dict[str, float] = {}
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return {}
+    for name in names:
+        m = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3})_.*\.rsc$", name)
+        if not m:
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(backup_dir, name))
+        except OSError:
+            continue
+        if mtime > newest.get(m.group(1), 0.0):
+            newest[m.group(1)] = mtime
+    return {ip: datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S") for ip, t in newest.items()}
 
 
 def backup_filename(ip: str, identity: str, when: Optional[date] = None) -> str:

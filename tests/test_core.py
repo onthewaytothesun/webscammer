@@ -152,3 +152,30 @@ def test_length_encoding_known_values():
     assert RouterOSApi.encode_length(0x05) == b"\x05"
     assert RouterOSApi.encode_length(0x80) == b"\x80\x80"
     assert RouterOSApi.encode_length(0x4000) == b"\xc0\x40\x00"
+
+
+def test_backup_index_takes_newest_file_per_ip():
+    import tempfile
+    import time
+    from core import backup_index
+    with tempfile.TemporaryDirectory() as d:
+        def make(name, age_days):
+            path = os.path.join(d, name)
+            open(path, "w").write("x")
+            t = time.time() - age_days * 86400
+            os.utime(path, (t, t))
+        make("10.20.44.209_R1_2026-09-01.rsc", 20)
+        make("10.20.44.209_R1_2026-09-20.rsc", 2)
+        make("10.20.44.20_Other_2026-09-05.rsc", 10)   # must not match ...209
+        make("notes.txt", 1)
+        make("bad_R1_2026-09-01.rsc", 1)
+        idx = backup_index(d)
+        assert set(idx) == {"10.20.44.209", "10.20.44.20"}
+        assert idx["10.20.44.209"] > idx["10.20.44.20"]
+        assert backup_index(os.path.join(d, "missing")) == {}
+
+
+def test_device_row_has_last_backup_after_last_seen():
+    row = Device(ip="1.1.1.1", last_seen="a", last_backup="b").as_row()
+    keys = list(row)
+    assert keys.index("Last Backup") == keys.index("Last seen") + 1 and row["Last Backup"] == "b"
