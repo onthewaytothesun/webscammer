@@ -434,6 +434,10 @@ _V6_CONTENTS_LIMIT = 4095
 _READ_CHUNK = 32768
 
 
+class ExportTooLarge(RouterOSError):
+    """RouterOS < 7.13 can't hand a config this big over the API."""
+
+
 def _parse_size(value: str) -> Optional[int]:
     try:
         return int(value)
@@ -512,9 +516,8 @@ def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
                 size is None and got >= _V6_CONTENTS_LIMIT
             )
             if truncated:
-                raise RouterOSError(
-                    "config is %s bytes but this RouterOS returns only %d over the API; "
-                    "switch Command Type to SSH (or upgrade to RouterOS 7.13+)"
+                raise ExportTooLarge(
+                    "config is %s bytes but RouterOS < 7.13 returns only %d over the API"
                     % (size if size is not None else ">4K", got)
                 )
     finally:

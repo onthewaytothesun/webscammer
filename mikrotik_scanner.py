@@ -490,13 +490,18 @@ class ScannerApp:
                     )
                 else:
                     out = self._run_api_commands(dev, command, cfg)
-                self.log(f"--- {dev.ip} ({dev.identity}) via {cfg['cmdtype']} "
-                         f"{dev.reach_ip} ---\n{out}")
+                self.log(f"--- {dev.ip} ({dev.identity}) via {self._via(dev, cfg)} ---\n{out}")
                 self.ui_queue.put(("status", (iid, "Command OK")))
             except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip} (via {cfg['cmdtype']} {dev.reach_ip}): command failed: "
+                self.log(f"{dev.ip} (via {self._via(dev, cfg)}): command failed: "
                          f"{type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Command error: {exc}")))
+
+    @staticmethod
+    def _via(dev: Device, cfg: dict) -> str:
+        if cfg["cmdtype"] == "SSH":
+            return f"SSH {dev.reach_ip}:{cfg['ssh_port']}"
+        return f"API {dev.reach_ip}:{dev.api_port or cfg['api_ssl_port']}"
 
     def _run_api_commands(self, dev: Device, command: str, cfg: dict) -> str:
         api = core.open_device_api(
@@ -536,20 +541,21 @@ class ScannerApp:
             iid = dev.key or dev.ip
             try:
                 if cfg["cmdtype"] == "SSH":
-                    from ssh_client import export_config
-                    text = export_config(
-                        dev.reach_ip, cfg["user"], cfg["password"],
-                        port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0),
-                    )
+                    text = self._ssh_export(dev, cfg)
                 else:
-                    api = core.open_device_api(
-                        dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
-                        timeout=cfg["timeout"], logger=self.logger,
-                    )
                     try:
-                        text = core.fetch_export(api, logger=self.logger)
-                    finally:
-                        api.close()
+                        api = core.open_device_api(
+                            dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+                            timeout=cfg["timeout"], logger=self.logger,
+                        )
+                        try:
+                            text = core.fetch_export(api, logger=self.logger)
+                        finally:
+                            api.close()
+                    except core.ExportTooLarge as exc:
+                        # old RouterOS can't hand big configs over the API
+                        self.log(f"{dev.ip}: {exc}; trying SSH port {cfg['ssh_port']}")
+                        text = self._ssh_export(dev, cfg)
                 fname = backup_filename(dev.ip, dev.identity)
                 path = os.path.join(BACKUP_DIR, fname)
                 with open(path, "w", encoding="utf-8") as fh:
@@ -557,9 +563,16 @@ class ScannerApp:
                 self.log(f"{dev.ip}: backup saved -> Backups/{fname}")
                 self.ui_queue.put(("status", (iid, f"Backup: {fname}")))
             except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip} (via {cfg['cmdtype']} {dev.reach_ip}): backup failed: "
+                self.log(f"{dev.ip} (via {self._via(dev, cfg)}): backup failed: "
                          f"{type(exc).__name__}: {exc}")
                 self.ui_queue.put(("status", (iid, f"Backup error: {exc}")))
+
+    def _ssh_export(self, dev: Device, cfg: dict) -> str:
+        from ssh_client import export_config
+        return export_config(
+            dev.reach_ip, cfg["user"], cfg["password"],
+            port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0),
+        )
 
     # ---------------------------------------------------------- import/exp
     def on_export(self) -> None:
@@ -635,7 +648,13 @@ class ScannerApp:
                 self.log(f"Could not remove saved settings: {exc}")
 
     def _save_settings(self) -> None:
-        data = {
+        data = {}
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            pass
+        data.update({
             "user": self.var_user.get(),
             "network": self.var_network.get(),
             "api_port": self.var_api_port.get(),
@@ -646,7 +665,7 @@ class ScannerApp:
             "retries": self.var_retries.get(),
             "command": self.txt_command.get("1.0", END).rstrip(),
             "save": True,
-        }
+        })
         # Password is stored only when Save is ticked; base64 is obfuscation,
         # not encryption — the file is local to the operator's machine.
         data["password"] = base64.b64encode(self.var_pass.get().encode()).decode()
