@@ -181,3 +181,66 @@ def test_gui_winbox_button_passes_address_and_login():
         assert args == ["10.20.30.209:61291", "admin", "p w;&$'\""], args
     finally:
         app._on_close()
+
+
+def test_gui_double_click_last_backup_opens_the_newest_file():
+    import core
+    M, tk, root, app = _open()
+    opened, shown = [], []
+    real_open, real_info, real_err = core.open_with_default_app, M.messagebox.showinfo, M.messagebox.showerror
+    core.open_with_default_app = opened.append
+    M.messagebox.showinfo = lambda *a, **k: shown.append(a[1])
+    M.messagebox.showerror = lambda *a, **k: shown.append(a[1])
+    try:
+        for d in _devices():
+            app._upsert_device(d)
+        _pump(root)
+
+        clock = [1000]
+
+        def fast_double_click(x, y):
+            clock[0] += 10000  # well past Tk's double-click interval since the previous one
+            for ms in (clock[0], clock[0] + 100):  # 100 ms apart: Tk turns the 2nd into a double click
+                app.tree.event_generate("<ButtonPress-1>", x=x, y=y, time=ms)
+                app.tree.event_generate("<ButtonRelease-1>", x=x, y=y, time=ms + 10)
+            _pump(root, 2)
+
+        def double_click(iid, column):
+            bx, by, bw, bh = app.tree.bbox(iid, column)
+            fast_double_click(bx + 6, by + bh // 2)
+
+        older = os.path.join(M.BACKUP_DIR, "10.20.44.209_R1_2026-08-01.rsc")
+        newer = os.path.join(M.BACKUP_DIR, "10.20.44.209_R1_2026-09-20.rsc")
+        for path, age in ((older, 30), (newer, 2)):
+            open(path, "w").write("# config")
+            t = time.time() - age * 86400
+            os.utime(path, (t, t))
+
+        double_click("SN1", "Last Backup")
+        assert opened == [newer], opened
+
+        opened.clear()
+        double_click("SN2", "Last Backup")              # no backup and nothing recorded: silent
+        assert opened == [] and shown == []
+
+        app.devices["SN2"].last_backup = "2026-09-01 10:00:00"   # recorded, but the file is gone
+        double_click("SN2", "Last Backup")
+        assert opened == [] and len(shown) == 1 and "10.20.30.210" in shown[0]
+
+        shown.clear()
+        core.open_with_default_app = lambda path: (_ for _ in ()).throw(OSError("no program"))
+        double_click("SN1", "Last Backup")              # the OS can't open it: told, not crashed
+        assert len(shown) == 1 and newer in shown[0]
+
+        # a fast 2nd click on any other cell must still act like a normal click:
+        # two quick clicks on a checkbox tick it and un-tick it again (not "swallowed")
+        opened.clear()
+        bx, by, bw, bh = app.tree.bbox("SN1", "#0")
+        fast_double_click(bx + 3 + app._icon_size // 2, by + bh // 2)
+        assert app.checked == set() and opened == []
+        app.tree.event_generate("<ButtonPress-1>", x=bx + 3 + app._icon_size // 2, y=by + bh // 2, time=clock[0] + 10000)
+        _pump(root, 2)
+        assert app.checked == {"SN1"}
+    finally:
+        core.open_with_default_app, M.messagebox.showinfo, M.messagebox.showerror = real_open, real_info, real_err
+        app._on_close()

@@ -226,6 +226,7 @@ class ScannerApp:
         hsb.pack(side="bottom", fill=X)
         self.tree.pack(fill=BOTH, expand=True)
         self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
         for seq in self._right_click_sequences():
             self.tree.bind(seq, self._on_tree_right_click)
@@ -464,6 +465,47 @@ class ScannerApp:
         elif col == self._winbox_col:
             self.on_winbox(iid)
 
+    def _column_name(self, column_id: str):
+        """Data column name for a '#N' id from identify_column, else None."""
+        if column_id == "#0":
+            return None
+        names = self.tree.cget("columns")
+        index = int(column_id[1:]) - 1
+        return names[index] if 0 <= index < len(COLUMNS) else None
+
+    def _on_tree_double_click(self, event) -> None:
+        # Tk delivers the 2nd click of a fast pair ONLY to this binding, not to
+        # the single-click one, so everything except the Last Backup cell must
+        # behave as an ordinary click (else a quick 2nd click on a checkbox,
+        # update or Winbox button would be swallowed).
+        if self.tree.identify_region(event.x, event.y) == "cell":
+            iid = self.tree.identify_row(event.y)
+            if iid and self._column_name(self.tree.identify_column(event.x)) == "Last Backup":
+                self.open_last_backup(iid)
+                return
+        self._on_tree_click(event)
+
+    def open_last_backup(self, iid: str) -> None:
+        """Open the device's newest backup in the default program for .rsc."""
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        path = core.latest_backup_file(BACKUP_DIR, dev.ip)
+        if path is None:
+            if dev.last_backup:  # the table says there was one, but the file is gone
+                messagebox.showinfo(
+                    "Backup", f"Файл бэкапа для {dev.ip} не найден в папке:\n{BACKUP_DIR}")
+            return
+        try:
+            core.open_with_default_app(path)
+        except OSError as exc:
+            self.log(f"{dev.ip}: could not open {os.path.basename(path)}: {exc}")
+            messagebox.showerror(
+                "Backup", f"Не удалось открыть файл:\n{path}\n\n{exc}\n\n"
+                          "Возможно, для файлов .rsc не назначена программа по умолчанию.")
+            return
+        self.log(f"{dev.ip}: opened {os.path.basename(path)}")
+
     def _on_tree_release(self, _event) -> None:
         if self._resizing_columns:
             self._resizing_columns = False
@@ -480,10 +522,7 @@ class ScannerApp:
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        col_id = self.tree.identify_column(event.x)
-        names = self.tree.cget("columns")
-        index = int(col_id[1:]) - 1 if col_id != "#0" else -1
-        name = names[index] if 0 <= index < len(COLUMNS) else None  # data cells only
+        name = self._column_name(self.tree.identify_column(event.x))  # data cells only
         row_text = "\t".join(self.tree.set(iid, c) for c in COLUMNS)  # tabs paste into Excel columns
         menu = tk.Menu(self.tree, tearoff=0)
         if name:

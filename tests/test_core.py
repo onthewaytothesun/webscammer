@@ -179,3 +179,44 @@ def test_device_row_has_last_backup_after_last_seen():
     row = Device(ip="1.1.1.1", last_seen="a", last_backup="b").as_row()
     keys = list(row)
     assert keys.index("Last Backup") == keys.index("Last seen") + 1 and row["Last Backup"] == "b"
+
+
+def test_latest_backup_file_picks_newest_for_that_ip_only():
+    import tempfile
+    import time
+    from core import latest_backup_file
+    with tempfile.TemporaryDirectory() as d:
+        def make(name, age_days):
+            path = os.path.join(d, name)
+            open(path, "w").write("x")
+            t = time.time() - age_days * 86400
+            os.utime(path, (t, t))
+            return path
+        make("10.20.44.209_Old_Name_2026-08-01.rsc", 30)
+        newest = make("10.20.44.209_New_Name_2026-09-20.rsc", 2)   # identity was renamed since
+        make("10.20.44.20_Other_2026-09-27.rsc", 1)                # a different device
+        make("10.20.44.209_notes.txt", 0)
+        assert latest_backup_file(d, "10.20.44.209") == newest
+        assert latest_backup_file(d, "10.20.44.99") is None
+        assert latest_backup_file(os.path.join(d, "missing"), "10.20.44.209") is None
+
+
+def test_open_with_default_app_uses_the_platform_opener(monkeypatch=None):
+    import core
+    calls = []
+    real_popen = core.subprocess.Popen
+    core.subprocess.Popen = lambda cmd, *a, **k: calls.append(cmd)
+    had = hasattr(os, "startfile")
+    old_startfile = getattr(os, "startfile", None)
+    os.startfile = lambda path: calls.append(("startfile", path))
+    try:
+        core.open_with_default_app("C:/b/x.rsc", platform="win32")
+        core.open_with_default_app("/b/x.rsc", platform="darwin")
+        core.open_with_default_app("/b/x.rsc", platform="linux")
+    finally:
+        core.subprocess.Popen = real_popen
+        if had:
+            os.startfile = old_startfile
+        else:
+            del os.startfile
+    assert calls == [("startfile", "C:/b/x.rsc"), ["open", "/b/x.rsc"], ["xdg-open", "/b/x.rsc"]]

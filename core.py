@@ -13,10 +13,12 @@ import os
 import re
 import shlex
 import ssl
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from routeros_api import RouterOSApi, RouterOSError
 
@@ -542,28 +544,60 @@ def sanitize(name: str) -> str:
     return cleaned or "unknown"
 
 
+_BACKUP_NAME = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})_.*\.rsc$")
+
+
+def _newest_backups(backup_dir: str) -> Dict[str, Tuple[float, str]]:
+    """{ip: (mtime, path)} of the newest IP_Identity_DATE.rsc file per IP."""
+    newest: Dict[str, Tuple[float, str]] = {}
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return {}
+    for name in names:
+        m = _BACKUP_NAME.match(name)
+        if not m:
+            continue
+        path = os.path.join(backup_dir, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime > newest.get(m.group(1), (0.0, ""))[0]:
+            newest[m.group(1)] = (mtime, path)
+    return newest
+
+
 def backup_index(backup_dir: str) -> Dict[str, str]:
     """Newest backup time per IP, read from the files in the Backups folder.
 
     Files are named IP_Identity_YYYY-MM-DD.rsc; the time comes from the file's
     modification time. Used for backups made before the app recorded them.
     """
-    newest: Dict[str, float] = {}
-    try:
-        names = os.listdir(backup_dir)
-    except OSError:
-        return {}
-    for name in names:
-        m = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3})_.*\.rsc$", name)
-        if not m:
-            continue
-        try:
-            mtime = os.path.getmtime(os.path.join(backup_dir, name))
-        except OSError:
-            continue
-        if mtime > newest.get(m.group(1), 0.0):
-            newest[m.group(1)] = mtime
-    return {ip: datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S") for ip, t in newest.items()}
+    return {
+        ip: datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        for ip, (mtime, _path) in _newest_backups(backup_dir).items()
+    }
+
+
+def latest_backup_file(backup_dir: str, ip: str) -> Optional[str]:
+    """Path of the newest backup file for this IP, or None if there is none."""
+    found = _newest_backups(backup_dir).get(ip)
+    return found[1] if found else None
+
+
+def open_with_default_app(path: str, platform: Optional[str] = None) -> None:
+    """Open a file with the program the OS associates with it.
+
+    Raises OSError when it can't be started (e.g. no program is associated).
+    """
+    platform = platform or sys.platform
+    if platform.startswith("win"):
+        os.startfile(path)  # type: ignore[attr-defined]  # Windows only
+    elif platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 
 def backup_filename(ip: str, identity: str, when: Optional[date] = None) -> str:
