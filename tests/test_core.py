@@ -220,3 +220,26 @@ def test_open_with_default_app_uses_the_platform_opener(monkeypatch=None):
         else:
             del os.startfile
     assert calls == [("startfile", "C:/b/x.rsc"), ["open", "/b/x.rsc"], ["xdg-open", "/b/x.rsc"]]
+
+
+def test_progress_text_helpers():
+    from core import estimate_remaining, format_duration, looks_like_error, progress_text
+    assert [format_duration(x) for x in (0, 45, 130, 3900, 100000, 7200)] == \
+        ["0 с", "45 с", "2 мин 10 с", "1 ч 05 мин", "1 д 3 ч", "2 ч"]
+    assert estimate_remaining(50, 100, 60.0) == 60.0          # half done in a minute -> a minute left
+    assert estimate_remaining(2, 100, 60.0) is None           # too early to tell
+    assert estimate_remaining(10, 100, 1.0) is None
+    assert estimate_remaining(100, 100, 60.0) == 0.0
+    assert estimate_remaining(0, 0, 5.0) is None
+    running = progress_text("Бэкап", 37, 120, 65, ok=34, bad=3, ok_label="успешно", bad_label="ошибок", threads=10)
+    assert running == ("Бэкап: 37 / 120 (30%) · осталось ≈ 2 мин 26 с · прошло 1 мин 05 с · "
+                       "успешно: 34 · ошибок: 3 · потоков: 10"), running
+    assert progress_text("Бэкап", 1, 120, 1, bad=0, bad_label="ошибок").startswith("Бэкап: 1 / 120 (0%) · прошло 1 с")
+    done = progress_text("Бэкап", 120, 120, 100, ok=117, bad=3, ok_label="успешно", bad_label="ошибок", finished=True)
+    assert done == "Готово · Бэкап: 120 / 120 · за 1 мин 40 с · успешно: 117 · ошибок: 3", done
+    assert progress_text("Сканирование", 45, 2048, 70, finished=True, stopped=True).startswith("Остановлено · Сканирование: 45 / 2048")
+    assert progress_text("Команды", 4, 10, 30, paused=True).startswith("Пауза · Команды: 4 / 10 (40%)")
+    assert "осталось" not in progress_text("Команды", 4, 10, 30, paused=True)
+    assert looks_like_error("Error: TimeoutError") and looks_like_error("Backup error: x") \
+        and looks_like_error("Command error: x")
+    assert not looks_like_error("OK (API-SSL:8729)") and not looks_like_error("Backup: 10.0.0.1_error_x.rsc")

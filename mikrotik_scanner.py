@@ -20,8 +20,8 @@ import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from tkinter import (
     BOTH,
@@ -58,6 +58,11 @@ DEFAULT_CHARS = {"IP": 14, "Identity": 20, "Board Name": 13, "RouterOS": 11, "Li
                  "Last seen": 19, "Last Backup": 19, "Status": 20, "winbox": 8}
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 WINBOX_LABEL = "▶ Winbox"  # per-row launcher, last column
+MAX_OPS_THREADS = 10  # Backup / SEND run this many devices at once at most
+ALL_MODELS = "Все модели"  # the "no filter" entry of the Board Name filter
+EMPTY_MODEL = "(пусто)"  # devices whose Board Name could not be read
+IDLE_TEXT = "Нет активных операций"
+ERROR_BG, ERROR_FG = "#ffd6d6", "#7a0000"  # rows of devices whose last operation failed
 
 
 class ScannerApp:
@@ -77,7 +82,15 @@ class ScannerApp:
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.sort_state: dict[str, bool] = {}
+        self._sort: tuple[str, bool] | None = None   # (column, reverse) currently applied
         self._resizing_columns = False
+        self._job: dict | None = None                # the running (or last finished) operation
+        self._progress_text = ""
+        self._hidden: set[str] = set()               # rows filtered out of the view
+        self._anchor: tuple[str, bool] | None = None  # last clicked checkbox, for Shift-click ranges
+        self._counts_dirty = True
+        self._models_dirty = True
+        self._last_cache_save = time.monotonic()
 
         # form variables
         self.var_user = StringVar()
@@ -92,6 +105,8 @@ class ScannerApp:
         self.var_cmdtype = StringVar(value="API/SSL")
         self.var_save = BooleanVar(value=False)
         self.var_find = StringVar()
+        self.var_model = StringVar(value=ALL_MODELS)
+        self.var_errors_only = BooleanVar(value=False)
 
         self._build_ui()
         self._load_settings()
@@ -137,6 +152,14 @@ class ScannerApp:
             ])
         except tk.TclError:
             pass
+
+        # Tk 8.6.9 (bundled with some Pythons) ignores Treeview tag colours
+        # unless the style map is filtered like this
+        def fixed_map(option):
+            return [e for e in style.map("Treeview", query_opt=option)
+                    if e[:2] != ("!disabled", "!selected")]
+
+        style.map("Treeview", foreground=fixed_map("foreground"), background=fixed_map("background"))
         # copy/paste for entries and log, independent of keyboard layout
         self._install_clipboard_bindings()
 
@@ -177,6 +200,7 @@ class ScannerApp:
         self.btn_stop = ttk.Button(actions, text="Stop", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Update", command=self.on_update).pack(side=LEFT, padx=2)
+        ttk.Button(actions, text="Delete", command=self.on_delete).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Backup", command=self.on_backup).pack(side=LEFT, padx=2)
         ttk.Label(actions, text="Command:").pack(side=RIGHT, padx=(2, 4))
         ttk.Button(actions, text="SEND", command=self.on_send).pack(side=RIGHT, padx=2)
@@ -199,9 +223,24 @@ class ScannerApp:
         nb.add(out_frame, text="Output / Log")
         self.notebook = nb
 
-        # progress bar
+        # progress: bar, then what is running / how far / how long is left
         self.progress = ttk.Progressbar(self.root, orient=HORIZONTAL, mode="determinate")
-        self.progress.pack(fill=X, padx=6, pady=2)
+        self.progress.pack(fill=X, padx=6, pady=(2, 0))
+        self.lbl_progress = ttk.Label(self.root, text=IDLE_TEXT, anchor="w")
+        self.lbl_progress.pack(fill=X, padx=8)
+
+        # filters on the left, how many devices / how many ticked on the right
+        filters = ttk.Frame(self.root)
+        filters.pack(fill=X, padx=6, pady=(4, 0))
+        ttk.Label(filters, text="Модель (Board Name):").pack(side=LEFT, padx=(2, 4))
+        self.model_combo = ttk.Combobox(filters, textvariable=self.var_model, state="readonly",
+                                        width=28, values=[ALL_MODELS])
+        self.model_combo.pack(side=LEFT)
+        self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._on_filter_change())
+        ttk.Checkbutton(filters, text="Только с ошибками", variable=self.var_errors_only,
+                        command=self._on_filter_change).pack(side=LEFT, padx=12)
+        self.lbl_counts = ttk.Label(filters, anchor="e")
+        self.lbl_counts.pack(side=RIGHT, padx=4)
 
         # table
         table_frame = ttk.Frame(self.root)
@@ -225,6 +264,7 @@ class ScannerApp:
         vsb.pack(side=RIGHT, fill=Y)
         hsb.pack(side="bottom", fill=X)
         self.tree.pack(fill=BOTH, expand=True)
+        self.tree.tag_configure("error", background=ERROR_BG, foreground=ERROR_FG)
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
@@ -365,29 +405,34 @@ class ScannerApp:
                     self._handle_ui_message(kind, payload)
                 except Exception:  # noqa: BLE001 - keep the UI loop alive
                     self.logger.exception("UI message %r failed", kind)
+            try:
+                self._tick()
+            except Exception:  # noqa: BLE001
+                self.logger.exception("UI refresh failed")
         finally:
             self._after_id = self.root.after(100, self._drain_queue)
+
+    def _tick(self) -> None:
+        """Every 100 ms: progress text/bar, model list, counters."""
+        self._render_progress()
+        if self._models_dirty:
+            self._refresh_model_choices()
+        if self._counts_dirty:
+            self._update_counts()
 
     def _handle_ui_message(self, kind: str, payload) -> None:
         if kind == "log":
             self._write_log(payload)
         elif kind == "device":
             self._upsert_device(payload)
-        elif kind == "progress":
-            done, total = payload
-            self.progress["maximum"] = max(total, 1)
-            self.progress["value"] = done
         elif kind == "status":
-            iid, text = payload
-            if self.tree.exists(iid):
-                self.tree.set(iid, "Status", text)
-                self.devices[iid].status = text
+            iid, text, failed = payload
+            self._set_status(iid, text, failed)
         elif kind == "status_ip":
-            ip, text = payload
-            for iid, dev in self.devices.items():
-                if ip in (dev.ip, dev.reach_ip) and self.tree.exists(iid):
-                    dev.status = text
-                    self.tree.set(iid, "Status", text)
+            ip, text, failed = payload
+            for iid, dev in list(self.devices.items()):
+                if ip in (dev.ip, dev.reach_ip):
+                    self._set_status(iid, text, failed)
         elif kind == "row":
             dev = self.devices.get(payload)
             if dev is not None and self.tree.exists(payload):
@@ -396,6 +441,19 @@ class ScannerApp:
             self._save_devices()
         elif kind == "done":
             self._scan_finished(payload)
+        elif kind == "job_done":
+            self._finish_job(payload)
+
+    def _set_status(self, iid: str, text: str, failed: bool) -> None:
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        dev.status, dev.failed = text, failed
+        if self.tree.exists(iid):
+            self.tree.set(iid, "Status", text)
+            self.tree.item(iid, tags=self._row_tags(dev))
+        self._apply_visibility(iid)
+        self._counts_dirty = True
 
     def _default_width(self, column: str) -> int:
         font = tkfont.nametofont("TkDefaultFont")
@@ -408,10 +466,101 @@ class ScannerApp:
     def _row_image(self, iid: str):
         return self._icons[("row", iid in self.checked)]
 
+    def _row_tags(self, dev: Device) -> tuple:
+        return ("error",) if dev.failed else ()
+
     def _sync_header(self) -> None:
-        """Header box is ticked only while every row is."""
-        every = bool(self.devices) and all(i in self.checked for i in self.devices)
+        """Header box is ticked only while every visible row is."""
+        visible = [i for i in self.devices if i not in self._hidden]
+        every = bool(visible) and all(i in self.checked for i in visible)
         self.tree.heading("#0", image=self._icons[("head", every)])
+
+    # ---- filters: model (Board Name) and "errors only"
+    @staticmethod
+    def _model_key(dev: Device) -> str:
+        return dev.board_name or EMPTY_MODEL
+
+    def _matches_filter(self, dev: Device) -> bool:
+        model = self.var_model.get()
+        if model != ALL_MODELS and self._model_key(dev) != model:
+            return False
+        return dev.failed or not self.var_errors_only.get()
+
+    def _apply_visibility(self, iid: str) -> None:
+        """Show or hide one row after its data changed. A hidden row is never ticked."""
+        dev = self.devices.get(iid)
+        if dev is None or not self.tree.exists(iid):
+            return
+        show = self._matches_filter(dev)
+        if show and iid in self._hidden:
+            self._hidden.discard(iid)
+            self.tree.move(iid, "", "end")
+        elif not show and iid not in self._hidden:
+            self._hidden.add(iid)
+            self.tree.detach(iid)
+            if iid in self.checked:
+                self.checked.discard(iid)
+                self.tree.item(iid, image=self._row_image(iid))
+            if self._anchor and self._anchor[0] == iid:
+                self._anchor = None
+
+    def _sort_key(self, value: str):
+        parts = value.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            return (0, tuple(int(p) for p in parts))   # IP addresses sort numerically
+        return (1, value.lower())
+
+    def _ordered_iids(self) -> list:
+        iids = list(self.devices)
+        if self._sort:
+            column, reverse = self._sort
+            iids.sort(key=lambda i: self._sort_key(self.devices[i].as_row()[column]), reverse=reverse)
+        return iids
+
+    def _relayout(self) -> None:
+        """Re-apply the filters and the sort order to the whole table."""
+        iids = self._ordered_iids()
+        visible = [i for i in iids if self._matches_filter(self.devices[i])]
+        shown = set(visible)
+        hidden_now = {i for i in iids if i not in shown}
+        for iid in hidden_now - self._hidden:
+            self.tree.detach(iid)
+        for iid in hidden_now & self.checked:      # a hidden row is never ticked
+            self.checked.discard(iid)
+            self.tree.item(iid, image=self._row_image(iid))
+        for index, iid in enumerate(visible):      # move() also re-attaches hidden rows
+            self.tree.move(iid, "", index)
+        self._hidden = hidden_now
+        if self._anchor and self._anchor[0] not in shown:
+            self._anchor = None
+        self._sync_header()
+        self._counts_dirty = True
+
+    def _on_filter_change(self) -> None:
+        self._relayout()
+
+    def _refresh_model_choices(self) -> None:
+        self._models_dirty = False
+        models = sorted({self._model_key(d) for d in self.devices.values()}, key=str.lower)
+        values = [ALL_MODELS] + models
+        if list(self.model_combo.cget("values")) != values:
+            self.model_combo.configure(values=values)
+        if self.var_model.get() not in values:     # that model is gone (deleted / rescanned)
+            self.var_model.set(ALL_MODELS)
+            self._relayout()
+
+    def _update_counts(self) -> None:
+        self._counts_dirty = False
+        total = len(self.devices)
+        ticked = len(self.checked & self.devices.keys())
+        failed = sum(1 for d in self.devices.values() if d.failed)
+        text = f"Устройств: {total}"
+        if self._hidden:
+            text += f" (показано {total - len(self._hidden)})"
+        text += f" · отмечено: {ticked}"
+        if failed:
+            text += f" · с ошибками: {failed}"
+        self.lbl_counts.configure(text=text)
 
     def _upsert_device(self, dev: Device) -> None:
         iid = dev.key or dev.ip
@@ -428,13 +577,17 @@ class ScannerApp:
                 self.checked.add(iid)
             if self.tree.exists(other):
                 self.tree.delete(other)
+            self._hidden.discard(other)
             del self.devices[other]
         values = self._row_values(dev)
         if self.tree.exists(iid):
-            self.tree.item(iid, values=values, image=self._row_image(iid))
+            self.tree.item(iid, values=values, image=self._row_image(iid), tags=self._row_tags(dev))
         else:
-            self.tree.insert("", END, iid=iid, values=values, image=self._row_image(iid))
+            self.tree.insert("", END, iid=iid, values=values, image=self._row_image(iid),
+                             tags=self._row_tags(dev))
         self.devices[iid] = dev
+        self._apply_visibility(iid)
+        self._counts_dirty = self._models_dirty = True
 
     # --------------------------------------------------------- table logic
     def _on_tree_click(self, event) -> None:
@@ -454,16 +607,38 @@ class ScannerApp:
                 return
             rel = event.x - box[0]  # x inside the cell; image = checkbox, gap, update button
             if rel < self._icon_size + self._icon_gap // 2 + 3:
-                if iid in self.checked:
-                    self.checked.discard(iid)
-                else:
-                    self.checked.add(iid)
-                self.tree.item(iid, image=self._row_image(iid))
-                self._sync_header()
+                self._toggle_check(iid, shift=bool(event.state & 0x1))
             elif rel < self._icon_w + 10:
                 self.on_update_one(iid)
         elif col == self._winbox_col:
             self.on_winbox(iid)
+
+    def _set_checked(self, iid: str, state: bool) -> None:
+        if state:
+            self.checked.add(iid)
+        else:
+            self.checked.discard(iid)
+        self.tree.item(iid, image=self._row_image(iid))
+
+    def _toggle_check(self, iid: str, shift: bool = False) -> None:
+        """Click on a row's checkbox. With Shift: every visible row from the
+        previously clicked checkbox to this one gets the state that one got."""
+        if shift and self._anchor:
+            visible = list(self.tree.get_children(""))
+            if self._anchor[0] in visible and iid in visible:
+                first, last = sorted((visible.index(self._anchor[0]), visible.index(iid)))
+                state = self._anchor[1]
+                for other in visible[first:last + 1]:
+                    self._set_checked(other, state)
+                self._anchor = (iid, state)
+                self._sync_header()
+                self._counts_dirty = True
+                return
+        state = iid not in self.checked
+        self._set_checked(iid, state)
+        self._anchor = (iid, state)
+        self._sync_header()
+        self._counts_dirty = True
 
     def _column_name(self, column_id: str):
         """Data column name for a '#N' id from identify_column, else None."""
@@ -608,8 +783,7 @@ class ScannerApp:
         dev = self.devices.get(iid)
         if dev is None:
             return
-        if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Update", "A scan is already running.")
+        if self._busy():
             return
         cfg = self._read_config()
         self.tree.set(iid, "Status", "Updating…")
@@ -628,34 +802,26 @@ class ScannerApp:
                 self.ui_queue.put(("device", fresh))
             except Exception as exc:  # noqa: BLE001
                 self.log(f"{ip}: update failed: {type(exc).__name__}: {exc}")
-                self.ui_queue.put(("status", (iid, f"Error: {type(exc).__name__}: {exc}")))
+                self.ui_queue.put(("status", (iid, f"Error: {type(exc).__name__}: {exc}", True)))
             self.ui_queue.put(("save_devices", None))
 
         threading.Thread(target=work, daemon=True).start()
 
     def toggle_all(self) -> None:
-        all_iids = self.tree.get_children("")
-        select = not (all_iids and self.checked >= set(all_iids))
-        self.checked = set(all_iids) if select else set()
-        for iid in all_iids:
-            self.tree.item(iid, image=self._row_image(iid))
+        """Header checkbox: tick every visible row, or clear them if all are ticked."""
+        visible = list(self.tree.get_children(""))
+        select = not (visible and all(i in self.checked for i in visible))
+        for iid in visible:
+            self._set_checked(iid, select)
+        self._anchor = None
         self._sync_header()
+        self._counts_dirty = True
 
     def sort_by(self, column: str) -> None:
         reverse = self.sort_state.get(column, False)
-        items = [(self.tree.set(i, column), i) for i in self.tree.get_children("")]
-
-        def key(pair):
-            val = pair[0]
-            parts = val.split(".")
-            if len(parts) == 4 and all(p.isdigit() for p in parts):
-                return tuple(int(p) for p in parts)
-            return val.lower()
-
-        items.sort(key=key, reverse=reverse)
-        for index, (_, iid) in enumerate(items):
-            self.tree.move(iid, "", index)
+        self._sort = (column, reverse)
         self.sort_state[column] = not reverse
+        self._relayout()
 
     def on_find(self) -> None:
         needle = self.var_find.get().strip().lower()
@@ -673,10 +839,12 @@ class ScannerApp:
                 return
         messagebox.showinfo("Find", "No match found.")
 
+    def selected_iids(self) -> list:
+        """Ticked devices (table row ids), in the order they are shown."""
+        return [i for i in self.tree.get_children("") if i in self.checked and i in self.devices]
+
     def selected_devices(self) -> list[Device]:
-        if self.checked:
-            return [self.devices[i] for i in self.checked if i in self.devices]
-        return []
+        return [self.devices[i] for i in self.selected_iids()]
 
     # -------------------------------------------------------------- config
     def _read_config(self):
@@ -716,10 +884,149 @@ class ScannerApp:
             "retries": retries,
         }
 
+    # ------------------------------------------------------ operations (jobs)
+    def _busy(self) -> bool:
+        """True, after telling the user, while an operation is still running."""
+        job = self._job
+        if job is not None and not job["finished"]:
+            messagebox.showwarning(
+                "Операция выполняется",
+                f"Сейчас выполняется: {job['title']}.\nДождитесь окончания или нажмите Stop.")
+            return True
+        return False
+
+    def _job_elapsed(self, job: dict) -> float:
+        """Seconds the job has been working (time spent paused is not counted)."""
+        if job["finished"]:
+            return job["elapsed"]
+        now = time.monotonic()
+        paused = job["paused_total"]
+        if job["pause_started"] is not None:
+            paused += now - job["pause_started"]
+        return max(0.0, now - job["t0"] - paused)
+
+    def _job_text(self, job: dict) -> str:
+        return core.progress_text(
+            job["title"], job["done"], job["total"], self._job_elapsed(job),
+            ok=job["ok"], bad=job["bad"], ok_label=job["ok_label"], bad_label=job["bad_label"],
+            paused=self.pause_event.is_set() and not job["finished"],
+            finished=job["finished"], stopped=job["stopped"], threads=job["threads"],
+        )
+
+    def _render_progress(self) -> None:
+        job = self._job
+        if job is None:
+            return
+        self.progress["maximum"] = max(job["total"], 1)
+        self.progress["value"] = job["done"]
+        text = self._job_text(job)
+        if text != self._progress_text:
+            self._progress_text = text
+            self.lbl_progress.configure(text=text)
+        if not job["finished"] and time.monotonic() - self._last_cache_save > 30:
+            self._save_devices()   # a long job must not lose its results if the app dies
+
+    def _start_job(self, title: str, items, func, threads: int, ok_label: str = "",
+                   bad_label: str = "", on_finish=None) -> None:
+        """Run func(item) -> bool for every item in `threads` worker threads,
+        with progress, time left, Pause and Stop. func returns True on success."""
+        items = list(items)
+        job = {
+            "title": title, "total": len(items), "done": 0, "ok": 0, "bad": 0,
+            "threads": max(1, min(threads, len(items))), "ok_label": ok_label,
+            "bad_label": bad_label, "t0": time.monotonic(), "paused_total": 0.0,
+            "pause_started": None, "finished": False, "stopped": False, "elapsed": 0.0,
+        }
+        self._job = job
+        self._last_cache_save = time.monotonic()
+        self.stop_event.clear()
+        self.pause_event.clear()
+        self.btn_pause.configure(state="normal", text="Pause")
+        self.btn_stop.configure(state="normal")
+        self._progress_text = ""
+        self._render_progress()
+        self.worker = threading.Thread(
+            target=self._run_job, args=(job, items, func, on_finish), daemon=True)
+        self.worker.start()
+
+    def _run_job(self, job: dict, items: list, func, on_finish) -> None:
+        feed = iter(items)
+        lock = threading.Lock()
+        end = object()
+
+        def next_item():
+            with lock:
+                return next(feed, end)
+
+        def loop() -> None:
+            while True:
+                while self.pause_event.is_set() and not self.stop_event.is_set():
+                    time.sleep(0.2)
+                if self.stop_event.is_set():
+                    return
+                item = next_item()
+                if item is end:
+                    return
+                try:
+                    ok = bool(func(item))
+                except Exception:  # noqa: BLE001 - one bad device must not stop the job
+                    self.logger.exception("%s: item failed", job["title"])
+                    ok = False
+                with lock:
+                    job["done"] += 1
+                    job["ok" if ok else "bad"] += 1
+
+        workers = [threading.Thread(target=loop, daemon=True) for _ in range(job["threads"])]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+        if on_finish is not None:
+            try:
+                on_finish(job)
+            except Exception:  # noqa: BLE001
+                self.logger.exception("%s: finishing step failed", job["title"])
+        job["elapsed"] = self._job_elapsed(job)
+        job["stopped"] = self.stop_event.is_set() and job["done"] < job["total"]
+        job["finished"] = True
+        self.ui_queue.put(("job_done", job))
+
+    def _finish_job(self, job: dict) -> None:
+        self.pause_event.clear()
+        self.btn_pause.configure(state="disabled", text="Pause")
+        self.btn_stop.configure(state="disabled")
+        self._render_progress()
+        self.log(self._progress_text)
+        self._save_devices()
+
+    def on_pause(self) -> None:
+        job = self._job
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            if job is not None and job["pause_started"] is not None:
+                job["paused_total"] += time.monotonic() - job["pause_started"]
+                job["pause_started"] = None
+            self.btn_pause.configure(text="Pause")
+            self.log("Resumed.")
+        else:
+            self.pause_event.set()
+            if job is not None and not job["finished"]:
+                job["pause_started"] = time.monotonic()
+            self.btn_pause.configure(text="Resume")
+            self.log("Paused.")
+
+    def on_stop(self) -> None:
+        job = self._job
+        if job is not None and job["pause_started"] is not None:
+            job["paused_total"] += time.monotonic() - job["pause_started"]
+            job["pause_started"] = None
+        self.stop_event.set()
+        self.pause_event.clear()
+        self.log("Stopping… (devices already in progress will finish)")
+
     # ---------------------------------------------------------------- scan
     def on_scan(self) -> None:
-        if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Scan", "A scan is already running.")
+        if self._busy():
             return
         if self.devices and not messagebox.askyesno(
             "New Scan",
@@ -735,17 +1042,22 @@ class ScannerApp:
         if not targets:
             messagebox.showerror("Scan", "Enter a network, e.g. 192.168.0.0/24")
             return
-        # fresh scan clears the table
-        for iid in self.tree.get_children(""):
-            self.tree.delete(iid)
+        # fresh scan clears the table (filters too: new rows must not start hidden)
+        for iid in list(self.devices):
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
         self.devices.clear()
         self.checked.clear()
+        self._hidden.clear()
+        self._anchor = None
+        self.var_model.set(ALL_MODELS)
+        self.var_errors_only.set(False)
         self._sync_header()
+        self._counts_dirty = self._models_dirty = True
         self._start_scan(targets, "New scan")
 
     def on_update(self) -> None:
-        if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Update", "A scan is already running.")
+        if self._busy():
             return
         # rescan known devices plus any other host in the subnet
         subnet = self._targets_or_warn()
@@ -767,32 +1079,13 @@ class ScannerApp:
             return None
 
     def _start_scan(self, targets: list[str], label: str) -> None:
-        self.stop_event.clear()
-        self.pause_event.clear()
         self._maybe_save_settings()
         cfg = self._read_config()
-        self.btn_pause.configure(state="normal", text="Pause")
-        self.btn_stop.configure(state="normal")
-        self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
-                 f"timeout {cfg['timeout']}s, {cfg['retries']} retries, "
-                 f"API-SSL port {cfg['api_ssl_port']} (plain API 8728 only if that port is refused).")
-        self.worker = threading.Thread(
-            target=self._scan_worker, args=(targets, cfg), daemon=True
-        )
-        self.worker.start()
-
-    def _scan_worker(self, targets: list[str], cfg: dict) -> None:
-        total = len(targets)
-        done = 0
         found: list[Device] = []
-        lock = threading.Lock()
+        # only addresses of devices already in the table need a red status when they fail
+        known = {a for d in self.devices.values() for a in (d.ip, d.reach_ip)}
 
-        def work(ip: str):
-            nonlocal done
-            while self.pause_event.is_set() and not self.stop_event.is_set():
-                threading.Event().wait(0.2)
-            if self.stop_event.is_set():
-                return None
+        def scan_one(ip: str) -> bool:
             try:
                 dev = core.scan_host(
                     ip, cfg["user"], cfg["password"],
@@ -800,56 +1093,44 @@ class ScannerApp:
                     timeout=cfg["timeout"], retries=cfg["retries"],
                     logger=self.logger,
                 )
-                dev.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                dev.last_seen = datetime.now().strftime(TIME_FORMAT)
                 self.log(f"{ip}: found {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
                 self.ui_queue.put(("device", dev))  # show it right away
+                found.append(dev)
+                return True
             except Exception as exc:  # noqa: BLE001 - report every failure
-                dev = None
                 self.log(f"{ip}: {type(exc).__name__}: {exc}")
-                # a device already in the table must not keep a stale "OK"
-                self.ui_queue.put(("status_ip", (ip, f"Error: {type(exc).__name__}: {exc}")))
-            finally:
-                with lock:
-                    done += 1
-                    self.ui_queue.put(("progress", (done, total)))
-            return dev
+                if ip in known:   # a device already in the table must not keep a stale "OK"
+                    self.ui_queue.put(("status_ip", (ip, f"Error: {type(exc).__name__}: {exc}", True)))
+                return False
 
-        with ThreadPoolExecutor(max_workers=cfg["threads"]) as pool:
-            for dev in pool.map(work, targets):
-                if dev is not None:
-                    found.append(dev)
+        def finish(_job: dict) -> None:
+            self.ui_queue.put(("done", dedupe_devices(found)))
 
-        deduped = dedupe_devices(found)
-        self.ui_queue.put(("done", deduped))
+        self.log(f"{label}: {len(targets)} target(s), {cfg['threads']} threads, "
+                 f"timeout {cfg['timeout']}s, {cfg['retries']} retries, "
+                 f"API-SSL port {cfg['api_ssl_port']} (plain API 8728 only if that port is refused).")
+        self._start_job("Сканирование" if label == "New scan" else "Обновление", targets,
+                        scan_one, cfg["threads"], ok_label="найдено", on_finish=finish)
 
     def _scan_finished(self, deduped: list[Device]) -> None:
         for dev in deduped:
             self._upsert_device(dev)
-        self.btn_pause.configure(state="disabled", text="Pause")
-        self.btn_stop.configure(state="disabled")
         self._write_log(f"Scan complete: {len(deduped)} unique device(s).")
         self._seed_last_backup()
-        self._sync_header()
+        self._relayout()   # sort order / filters for the rows added during the scan
         self._save_devices()  # cache results so a restart doesn't require rescanning
 
-    def on_pause(self) -> None:
-        if self.pause_event.is_set():
-            self.pause_event.clear()
-            self.btn_pause.configure(text="Pause")
-            self.log("Resumed.")
-        else:
-            self.pause_event.set()
-            self.btn_pause.configure(text="Resume")
-            self.log("Paused.")
-
-    def on_stop(self) -> None:
-        self.stop_event.set()
-        self.pause_event.clear()
-        self.log("Stopping…")
-
     # -------------------------------------------------------------- send
+    @staticmethod
+    def _ops_threads(cfg: dict) -> int:
+        """Backup / SEND run several devices at once, but never more than MAX_OPS_THREADS."""
+        return max(1, min(cfg["threads"], MAX_OPS_THREADS))
+
     def on_send(self) -> None:
+        if self._busy():
+            return
         devices = self.selected_devices()
         if not devices:
             messagebox.showinfo("Send", "Tick one or more devices in the table first.")
@@ -860,28 +1141,29 @@ class ScannerApp:
             return
         cfg = self._read_config()
         self.notebook.select(1)  # show output tab
-        threading.Thread(
-            target=self._send_worker, args=(devices, command, cfg), daemon=True
-        ).start()
+        self.log(f"Send ({cfg['cmdtype']}): {len(devices)} device(s), {self._ops_threads(cfg)} at a time")
+        self._start_job("Команды", devices, lambda dev: self._send_one(dev, command, cfg),
+                        self._ops_threads(cfg), ok_label="успешно", bad_label="ошибок")
 
-    def _send_worker(self, devices, command, cfg) -> None:
-        for dev in devices:
-            iid = dev.key or dev.ip
-            try:
-                if cfg["cmdtype"] == "SSH":
-                    from ssh_client import run_ssh_command
-                    out = self._ssh_try_addresses(dev, cfg, lambda host: run_ssh_command(
-                        host, cfg["user"], cfg["password"], command,
-                        port=cfg["ssh_port"], timeout=cfg["timeout"],
-                    ))
-                else:
-                    out = self._run_api_commands(dev, command, cfg)
-                self.log(f"--- {dev.ip} ({dev.identity}) via {self._via(dev, cfg)} ---\n{out}")
-                self.ui_queue.put(("status", (iid, "Command OK")))
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip} (via {self._via(dev, cfg)}): command failed: "
-                         f"{type(exc).__name__}: {exc}")
-                self.ui_queue.put(("status", (iid, f"Command error: {exc}")))
+    def _send_one(self, dev: Device, command: str, cfg: dict) -> bool:
+        iid = dev.key or dev.ip
+        try:
+            if cfg["cmdtype"] == "SSH":
+                from ssh_client import run_ssh_command
+                out = self._ssh_try_addresses(dev, cfg, lambda host: run_ssh_command(
+                    host, cfg["user"], cfg["password"], command,
+                    port=cfg["ssh_port"], timeout=cfg["timeout"], retries=cfg["retries"],
+                ))
+            else:
+                out = self._run_api_commands(dev, command, cfg)
+            self.log(f"--- {dev.ip} ({dev.identity}) via {self._via(dev, cfg)} ---\n{out}")
+            self.ui_queue.put(("status", (iid, "Command OK", False)))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"{dev.ip} (via {self._via(dev, cfg)}): command failed: "
+                     f"{type(exc).__name__}: {exc}")
+            self.ui_queue.put(("status", (iid, f"Command error: {exc}", True)))
+            return False
 
     @staticmethod
     def _via(dev: Device, cfg: dict) -> str:
@@ -912,49 +1194,51 @@ class ScannerApp:
 
     # ------------------------------------------------------------- backup
     def on_backup(self) -> None:
+        if self._busy():
+            return
         devices = self.selected_devices()
         if not devices:
             messagebox.showinfo("Backup", "Tick one or more devices to back up.")
             return
         cfg = self._read_config()
         os.makedirs(BACKUP_DIR, exist_ok=True)
-        threading.Thread(
-            target=self._backup_worker, args=(devices, cfg), daemon=True
-        ).start()
+        self.log(f"Backup ({cfg['cmdtype']}): {len(devices)} device(s), {self._ops_threads(cfg)} at a time")
+        self._start_job("Бэкап", devices, lambda dev: self._backup_one(dev, cfg),
+                        self._ops_threads(cfg), ok_label="успешно", bad_label="ошибок")
 
-    def _backup_worker(self, devices, cfg) -> None:
-        for dev in devices:
-            iid = dev.key or dev.ip
-            try:
-                if cfg["cmdtype"] == "SSH":
-                    text = self._ssh_export(dev, cfg)
-                else:
+    def _backup_one(self, dev: Device, cfg: dict) -> bool:
+        iid = dev.key or dev.ip
+        try:
+            if cfg["cmdtype"] == "SSH":
+                text = self._ssh_export(dev, cfg)
+            else:
+                try:
+                    api = core.open_device_api(
+                        dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+                        timeout=cfg["timeout"], logger=self.logger,
+                    )
                     try:
-                        api = core.open_device_api(
-                            dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
-                            timeout=cfg["timeout"], logger=self.logger,
-                        )
-                        try:
-                            text = core.fetch_export(api, logger=self.logger)
-                        finally:
-                            api.close()
-                    except core.ExportTooLarge as exc:
-                        # old RouterOS can't hand big configs over the API
-                        self.log(f"{dev.ip}: {exc}; trying SSH port {cfg['ssh_port']}")
-                        text = self._ssh_export(dev, cfg)
-                fname = backup_filename(dev.ip, dev.identity)
-                path = os.path.join(BACKUP_DIR, fname)
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write(text + "\n")
-                dev.last_backup = datetime.now().strftime(TIME_FORMAT)
-                self.log(f"{dev.ip}: backup saved -> Backups/{fname}")
-                self.ui_queue.put(("status", (iid, f"Backup: {fname}")))
-                self.ui_queue.put(("row", iid))  # shows the new Last Backup time
-                self.ui_queue.put(("save_devices", None))
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"{dev.ip} (via {self._via(dev, cfg)}): backup failed: "
-                         f"{type(exc).__name__}: {exc}")
-                self.ui_queue.put(("status", (iid, f"Backup error: {exc}")))
+                        text = core.fetch_export(api, logger=self.logger)
+                    finally:
+                        api.close()
+                except core.ExportTooLarge as exc:
+                    # old RouterOS can't hand big configs over the API
+                    self.log(f"{dev.ip}: {exc}; trying SSH port {cfg['ssh_port']}")
+                    text = self._ssh_export(dev, cfg)
+            fname = backup_filename(dev.ip, dev.identity)
+            path = os.path.join(BACKUP_DIR, fname)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+            dev.last_backup = datetime.now().strftime(TIME_FORMAT)
+            self.log(f"{dev.ip}: backup saved -> Backups/{fname}")
+            self.ui_queue.put(("status", (iid, f"Backup: {fname}", False)))
+            self.ui_queue.put(("row", iid))  # shows the new Last Backup time
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"{dev.ip} (via {self._via(dev, cfg)}): backup failed: "
+                     f"{type(exc).__name__}: {exc}")
+            self.ui_queue.put(("status", (iid, f"Backup error: {exc}", True)))
+            return False
 
     def _ssh_try_addresses(self, dev: Device, cfg: dict, action):
         """Run action(host) over SSH on the scanned address, then on the
@@ -976,12 +1260,42 @@ class ScannerApp:
         from ssh_client import export_config
         return self._ssh_try_addresses(dev, cfg, lambda host: export_config(
             host, cfg["user"], cfg["password"],
-            port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0),
+            port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0), retries=cfg["retries"],
         ))
+
+    # ------------------------------------------------------------- delete
+    def on_delete(self) -> None:
+        """Remove the ticked devices from the table (not from the network)."""
+        if self._busy():
+            return
+        iids = self.selected_iids()
+        if not iids:
+            messagebox.showinfo("Delete", "Отметьте галочками устройства, которые нужно удалить из таблицы.")
+            return
+        if not messagebox.askyesno(
+            "Delete",
+            f"Удалить из таблицы отмеченные устройства: {len(iids)}?\n\n"
+            "Удаляются только строки таблицы и их запись в сохранённом списке. "
+            "Сами устройства и файлы бэкапов не затрагиваются.\n"
+            "Вернуть строки можно новым сканом или импортом CSV.",
+            icon="warning", default="no",
+        ):
+            return
+        for iid in iids:
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
+            self.devices.pop(iid, None)
+            self.checked.discard(iid)
+            self._hidden.discard(iid)
+        self._anchor = None
+        self._sync_header()
+        self._counts_dirty = self._models_dirty = True
+        self._save_devices()
+        self.log(f"Deleted {len(iids)} device(s) from the table.")
 
     # ---------------------------------------------------------- import/exp
     def on_export(self) -> None:
-        if not self.devices:
+        if not self.devices or len(self._hidden) == len(self.devices):
             messagebox.showinfo("Export", "Nothing to export.")
             return
         path = filedialog.asksaveasfilename(
@@ -997,9 +1311,11 @@ class ScannerApp:
                 fh, fieldnames=COLUMNS + ("Mgmt IP",), delimiter=CSV_DELIMITER
             )
             writer.writeheader()
-            for dev in self.devices.values():
+            rows = [self.devices[i] for i in self.tree.get_children("") if i in self.devices]
+            for dev in rows:
                 writer.writerow({**dev.as_row(), "Mgmt IP": dev.reach_ip})
-        self.log(f"Exported {len(self.devices)} row(s) -> {path}")
+        note = f" (filter active: {len(self.devices)} in total)" if self._hidden else ""
+        self.log(f"Exported {len(rows)} row(s){note} -> {path}")
 
     def on_import(self) -> None:
         path = filedialog.askopenfilename(
@@ -1024,6 +1340,7 @@ class ScannerApp:
                     last_seen=row.get("Last seen", ""),
                     last_backup=row.get("Last Backup", "") or "",
                     status=row.get("Status", ""),
+                    failed=core.looks_like_error(row.get("Status", "")),
                     key=row.get("IP", ""),
                     connect_ip=row.get("Mgmt IP", "") or "",
                 )
@@ -1055,6 +1372,7 @@ class ScannerApp:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(rows, fh, indent=1)
             os.replace(tmp, DEVICES_FILE)  # a crash mid-write must not destroy the cache
+            self._last_cache_save = time.monotonic()
         except (OSError, TypeError) as exc:
             self.log(f"Could not save results cache: {exc}")
 
@@ -1071,12 +1389,16 @@ class ScannerApp:
         loaded = 0
         for row in rows if isinstance(rows, list) else []:
             try:
-                self._upsert_device(Device(**{k: v for k, v in row.items() if k in allowed}))
+                dev = Device(**{k: v for k, v in row.items() if k in allowed})
+                if "failed" not in row:   # cache from before errors were tracked
+                    dev.failed = core.looks_like_error(dev.status)
+                self._upsert_device(dev)
                 loaded += 1
             except (TypeError, AttributeError):
                 continue  # skip a malformed entry, keep the rest
         self._seed_last_backup()
         self._sync_header()
+        self._counts_dirty = self._models_dirty = True
         if loaded:
             self._write_log(f"Loaded {loaded} cached device(s) from last session. "
                             f"Use Update to refresh, New Scan to start over.")

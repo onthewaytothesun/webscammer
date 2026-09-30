@@ -35,6 +35,7 @@ class Device:
     last_seen: str = ""
     last_backup: str = ""
     status: str = ""
+    failed: bool = False  # the last operation on this device failed (row turns red)
     # internal
     key: str = ""  # unique hardware key (serial) for de-duplication
     addresses: List[Dict[str, str]] = field(default_factory=list)
@@ -598,6 +599,71 @@ def open_with_default_app(path: str, platform: Optional[str] = None) -> None:
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+# ---------------------------------------------------------------------------
+# Progress text
+# ---------------------------------------------------------------------------
+def format_duration(seconds: float) -> str:
+    """45 -> '45 с', 130 -> '2 мин 10 с', 3900 -> '1 ч 05 мин', 100000 -> '1 д 3 ч'."""
+    s = int(round(max(0.0, seconds)))
+    if s < 60:
+        return f"{s} с"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m} мин {s:02d} с" if s else f"{m} мин"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} ч {m:02d} мин" if m else f"{h} ч"
+    d, h = divmod(h, 24)
+    return f"{d} д {h} ч" if h else f"{d} д"
+
+
+def estimate_remaining(done: int, total: int, active_elapsed: float,
+                       min_done: int = 3, min_elapsed: float = 2.0) -> Optional[float]:
+    """Seconds left at the pace so far, or None while it is too early to tell.
+
+    `active_elapsed` must not include time spent paused.
+    """
+    if total <= 0:
+        return None
+    if done >= total:
+        return 0.0
+    if done < min_done or active_elapsed < min_elapsed:
+        return None
+    return (total - done) * active_elapsed / done
+
+
+def progress_text(title: str, done: int, total: int, active_elapsed: float, *,
+                  ok: int = 0, bad: int = 0, ok_label: str = "", bad_label: str = "",
+                  paused: bool = False, finished: bool = False, stopped: bool = False,
+                  threads: int = 0) -> str:
+    """One line for the progress bar: what runs, how far, how long, how long is left."""
+    parts = []
+    if finished:
+        parts.append(f"{'Остановлено' if stopped else 'Готово'} · {title}: {done} / {total}")
+        parts.append(f"за {format_duration(active_elapsed)}")
+    else:
+        pct = int(done * 100 / total) if total else 100
+        head = f"{title}: {done} / {total} ({pct}%)"
+        parts.append(("Пауза · " if paused else "") + head)
+        if not paused:
+            eta = estimate_remaining(done, total, active_elapsed)
+            if eta is not None:
+                parts.append(f"осталось ≈ {format_duration(eta)}")
+        parts.append(f"прошло {format_duration(active_elapsed)}")
+    if ok_label:
+        parts.append(f"{ok_label}: {ok}")
+    if bad_label and bad:
+        parts.append(f"{bad_label}: {bad}")
+    if threads and not finished:
+        parts.append(f"потоков: {threads}")
+    return " · ".join(parts)
+
+
+def looks_like_error(status: str) -> bool:
+    """Old caches stored only the status text: recognise the failure ones."""
+    return (status or "").startswith(("Error", "Command error", "Backup error"))
 
 
 def backup_filename(ip: str, identity: str, when: Optional[date] = None) -> str:
