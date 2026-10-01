@@ -6,9 +6,9 @@ API features work without it.
 paramiko 4+ dropped the SHA1 key exchanges and the ssh-rsa host key that
 RouterOS 6.x offers, so requirements.txt pins paramiko < 4.
 
-Connection problems are reported with the stage they happened at, and for a
-failed SSH handshake with what the device actually did (see diagnose_ssh), so
-the log says where to look.
+Connection problems are reported (in Russian, they are shown in the table and the
+log) with the stage they happened at, and for a failed SSH handshake with what
+the device actually did (see diagnose_ssh), so the log says where to look.
 """
 
 from __future__ import annotations
@@ -28,14 +28,17 @@ class SSHUnavailable(RuntimeError):
 class SSHStageError(RuntimeError):
     """SSH failure tagged with the stage it happened at (for the log).
 
-    transient: the connection could not be completed but may work on a retry.
-    diagnose:  it failed inside the SSH handshake, so probing the device helps.
+    transient:   the connection could not be completed but may work on a retry.
+    diagnose:    it failed inside the SSH handshake, so probing the device helps.
+    unreachable: nothing answers on that address:port at all (TCP level).
     """
 
-    def __init__(self, message: str, transient: bool = False, diagnose: bool = False):
+    def __init__(self, message: str, transient: bool = False, diagnose: bool = False,
+                 unreachable: bool = False):
         super().__init__(message)
         self.transient = transient
         self.diagnose = diagnose
+        self.unreachable = unreachable
 
 
 def _load_paramiko():
@@ -43,7 +46,7 @@ def _load_paramiko():
         import paramiko  # noqa: WPS433 (lazy import by design)
     except ImportError as exc:  # pragma: no cover - depends on environment
         raise SSHUnavailable(
-            "paramiko is not installed. Run: pip install -r requirements.txt"
+            "не установлена библиотека paramiko. Выполните: pip install -r requirements.txt"
         ) from exc
     return paramiko
 
@@ -103,7 +106,7 @@ def diagnose_ssh(host: str, port: int, timeout: float = 5.0) -> str:
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
     except OSError as exc:
-        return f"TCP connect failed ({exc})"
+        return f"TCP-подключение не удалось ({exc})"
     deadline = time.monotonic() + timeout
     try:
         banner = b""
@@ -118,44 +121,46 @@ def diagnose_ssh(host: str, port: int, timeout: float = 5.0) -> str:
                     break
                 banner += chunk
         except socket.timeout:
-            return (f"TCP connects but the device sends no SSH banner within {timeout:g}s: it is "
-                    f"overloaded, or a firewall holds the connection (tarpit / connection limit)")
+            return (f"TCP подключается, но устройство не присылает SSH-приветствие за {timeout:g} с: "
+                    f"оно перегружено, либо фаервол держит соединение (tarpit / лимит подключений)")
         except OSError as exc:
-            return (f"TCP connects but the connection is reset before any SSH banner ({exc}): "
-                    f"connection limit or a firewall rule on the device")
+            return (f"TCP подключается, но соединение сбрасывается до SSH-приветствия ({exc}): "
+                    f"лимит подключений или правило фаервола на устройстве")
         if not banner:
-            return ("TCP connects but the device closes the connection at once, without an SSH "
-                    "banner: connection limit / firewall rule, an overloaded device, or the port "
-                    "is not SSH")
+            return ("TCP подключается, но устройство сразу закрывает соединение, не прислав "
+                    "SSH-приветствие: лимит подключений / правило фаервола, перегруженное "
+                    "устройство или на этом порту не SSH")
         line = banner.split(b"\n")[0].decode("ascii", "replace").strip()
         if not line.startswith("SSH-"):
-            return f"the port answers, but not with SSH: {line[:40]!r}"
+            return f"порт отвечает, но не SSH: {line[:40]!r}"
         try:
             sock.sendall(b"SSH-2.0-mikrotik-scanner-probe\r\n")
             head = _recv_exact(sock, 5, deadline)
             (length,) = struct.unpack(">I", head[:4])
             if not 2 <= length <= 35000:
-                return f"SSH server '{line}' sent an invalid first packet"
+                return f"SSH-сервер '{line}' прислал некорректный первый пакет"
             body = _recv_exact(sock, length - 1, deadline)
             algorithms = parse_kexinit(body[:length - 1 - head[4]])
         except (socket.timeout, EOFError, OSError):
-            return (f"SSH server '{line}' answers with its banner, but then stops or closes "
-                    f"before the key exchange: the device is overloaded or limiting connections")
+            return (f"SSH-сервер '{line}' прислал приветствие, но затем замолчал или закрыл "
+                    f"соединение до обмена ключами: устройство перегружено или ограничивает подключения")
         if algorithms is None:
-            return f"SSH server '{line}' sent an unreadable key exchange message"
+            return f"SSH-сервер '{line}' прислал нечитаемое сообщение обмена ключами"
         ours = _our_algorithms()
         if ours:
+            names = {"kex": "обмена ключами", "host key": "ключа хоста",
+                     "cipher": "шифрования", "MAC": "проверки целостности (MAC)"}
             missing = [
-                f"no common {label}: the device offers {', '.join(algorithms[label])}; "
-                f"this program offers {', '.join(ours[label])}"
+                f"нет общих алгоритмов {names[label]}: устройство предлагает "
+                f"{', '.join(algorithms[label])}; программа — {', '.join(ours[label])}"
                 for label in ("kex", "host key", "cipher", "MAC")
                 if not set(algorithms[label]) & set(ours[label])
             ]
             if missing:
-                return f"SSH server '{line}' — " + "; ".join(missing)
-        return (f"SSH server '{line}' is alive and shares algorithms with this program, so the "
-                f"failure is on the device side: it was busy or limiting connections, or it "
-                f"refused the session (see the Disconnect reason if shown)")
+                return f"SSH-сервер '{line}' — " + "; ".join(missing)
+        return (f"SSH-сервер '{line}' жив и имеет общие с программой алгоритмы, значит сбой на "
+                f"стороне устройства: оно было занято, ограничивало подключения или отклонило "
+                f"сессию (причина — в строке Disconnect, если она есть)")
     finally:
         sock.close()
 
@@ -185,11 +190,12 @@ def _open_once(host, username, password, port, timeout):
         sock = socket.create_connection((host, port), timeout=timeout)
     except socket.timeout as exc:
         raise SSHStageError(
-            f"SSH port {where} did not answer (timed out): wrong SSH port, "
-            f"ssh service off/restricted in /ip service, or a firewall"
+            f"SSH-порт {where} не отвечает (таймаут): неверный порт SSH, служба ssh выключена "
+            f"или ограничена в /ip service, либо фаервол", unreachable=True,
         ) from exc
     except ConnectionRefusedError as exc:
-        raise SSHStageError(f"SSH port {where} refused the connection: wrong SSH port?") from exc
+        raise SSHStageError(
+            f"SSH-порт {where} отказал в соединении: неверный порт SSH?", unreachable=True) from exc
 
     # 2) SSH handshake + login
     client = paramiko.SSHClient()
@@ -216,21 +222,21 @@ def _open_once(host, username, password, port, timeout):
     except paramiko.AuthenticationException as exc:
         client.close()
         if "timeout" in str(exc).lower():   # a busy device answering too slowly
-            raise SSHStageError(f"SSH login to {where} timed out", transient=True) from exc
-        raise SSHStageError(f"SSH login to {where} failed (check username/password)") from exc
+            raise SSHStageError(f"вход по SSH на {where}: таймаут", transient=True) from exc
+        raise SSHStageError(f"не удалось войти по SSH на {where}: проверьте логин и пароль") from exc
     except (paramiko.SSHException, EOFError, OSError) as exc:
         client.close()
         reason = capture.disconnect_reason()
         detail = str(exc) or type(exc).__name__
         if reason:
-            detail += f" — the device ended the session: {reason}"
+            detail += f" — устройство завершило сессию: {reason}"
         hint = ""
         if "incompatible" in str(exc).lower():
-            hint = (f" (paramiko {paramiko.__version__} can't talk to old RouterOS: "
+            hint = (f" (paramiko {paramiko.__version__} не умеет говорить со старыми RouterOS: "
                     f"pip install \"paramiko<4\")")
         incompatible = "incompatible" in str(exc).lower()
         raise SSHStageError(
-            f"SSH handshake with {where} failed: {detail}{hint}",
+            f"SSH-рукопожатие с {where} не удалось: {detail}{hint}",
             transient=not incompatible, diagnose=True,
         ) from exc
     except Exception:
@@ -259,12 +265,13 @@ def _open_ssh(host, username, password, port, timeout, retries: int = 0):
     assert error is not None
     message = str(error)
     if attempts > 1 and error.transient:
-        message += f" (after {attempts} attempts)"
+        message += f" (после {attempts} попыток)"
     if error.diagnose:
-        message += f" | diagnosis: {diagnose_ssh(host, port)}"
+        message += f" | диагностика: {diagnose_ssh(host, port)}"
     if message == str(error):
         raise error
-    raise SSHStageError(message, transient=error.transient) from error.__cause__
+    raise SSHStageError(message, transient=error.transient,
+                        unreachable=error.unreachable) from error.__cause__
 
 
 def run_ssh_command(
@@ -286,7 +293,7 @@ def run_ssh_command(
             err = stderr.read().decode("utf-8", "replace")
         except socket.timeout as exc:
             raise SSHStageError(
-                f"SSH connected to {host}:{port} but the command did not finish in {timeout:g}s"
+                f"SSH подключён к {host}:{port}, но команда не выполнилась за {timeout:g} с"
             ) from exc
         return (out + err).strip("\r\n")
     finally:

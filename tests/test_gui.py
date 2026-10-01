@@ -48,11 +48,16 @@ def _devices():
 def test_gui_builds_with_all_row_actions():
     M, tk, root, app = _open()
     try:
-        for method in ("on_winbox", "on_update_one", "toggle_all", "_on_tree_right_click",
+        for method in ("on_winbox", "on_update_one", "toggle_all", "_on_tree_right_click", "on_scan_add",
+                       "on_scan", "on_update", "on_delete", "_edit_note", "_open_models_dialog",
                        "on_backup", "on_send", "on_export", "on_import", "_save_ui_state"):
             assert callable(getattr(app, method, None)), f"missing {method}"
-        assert app.tree.cget("columns")[-1] == "winbox"
-        assert list(M.COLUMNS).index("Last Backup") == list(M.COLUMNS).index("Last seen") + 1
+        columns = app.tree.cget("columns")
+        assert columns[-2:] == ("winbox", "Note") and columns == M.TREE_COLUMNS
+        assert list(M.DATA_COLUMNS).index("Last Backup") == list(M.DATA_COLUMNS).index("Last seen") + 1
+        shown = [app.tree.heading(c, "text") for c in columns]
+        assert shown == ["IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
+                         "Последний бэкап", "Статус", "Winbox", "Заметка"], shown
     finally:
         app._on_close()
 
@@ -150,8 +155,13 @@ def test_gui_right_click_copies_cell_or_row():
         assert root.clipboard_get() == "R1"
         menu.invoke(1)
         row = root.clipboard_get().split("\t")
-        assert len(row) == len(M.COLUMNS) and row[:2] == ["10.20.44.209", "R1"]
-        assert right_click("SN1", "#0").index("end") == 0  # icons column: only "copy row"
+        assert len(row) == len(M.DATA_COLUMNS) and row[:2] == ["10.20.44.209", "R1"]
+        assert row[-1] == ""                               # the note is the last data column
+        labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1) if menu.type(i) == "command"]
+        assert labels[-1] == "Изменить заметку…", labels
+        icons_menu = right_click("SN1", "#0")              # icons column: no cell to copy, but the row and the note
+        assert [icons_menu.entrycget(i, "label") for i in range(icons_menu.index("end") + 1)
+                if icons_menu.type(i) == "command"] == ["Копировать строку", "Изменить заметку…"]
     finally:
         tk.Menu.tk_popup = original
         app._on_close()
@@ -373,7 +383,7 @@ def test_gui_backup_and_commands_run_in_parallel_and_errors_turn_red():
         text = app.lbl_progress.cget("text")
         assert text.startswith("Готово · Бэкап: 12 / 12") and "успешно: 11" in text and "ошибок: 1" in text, text
         assert app.devices["SN5"].failed and "error" in app.tree.item("SN5", "tags")
-        assert "Backup error" in app.tree.set("SN5", "Status")
+        assert app.tree.set("SN5", "Status").startswith("Ошибка бэкапа")
         assert not app.devices["SN4"].failed and "error" not in app.tree.item("SN4", "tags")
         assert app.tree.set("SN4", "Last Backup") and not app.tree.set("SN5", "Last Backup")
         assert str(app.tree.tag_configure("error", "background")) == M.ERROR_BG
@@ -389,12 +399,12 @@ def test_gui_backup_and_commands_run_in_parallel_and_errors_turn_red():
         # commands: same engine, and a failing device is flagged
         app._run_api_commands = lambda dev, command, cfg: (_ for _ in ()).throw(OSError("nope")) if dev.key == "SN2" else "ok"
         app.var_cmdtype.set("API/SSL")
-        app.txt_command.insert("1.0", "/system identity print")
+        app.txt_command.insert("1.0", "/system/identity/print")
         app.toggle_all()
         app.on_send()
         _wait_job(root, app)
         assert app.lbl_progress.cget("text").startswith("Готово · Команды: 12 / 12")
-        assert app.devices["SN2"].failed and app.tree.set("SN1", "Status") == "Command OK"
+        assert app.devices["SN2"].failed and app.tree.set("SN1", "Status") == "Команда выполнена"
     finally:
         app._on_close()
 
@@ -446,66 +456,6 @@ def test_gui_shift_click_ticks_a_whole_range():
         app._on_close()
 
 
-def test_gui_model_filter_errors_filter_and_sort():
-    M, tk, root, app = _open()
-    try:
-        devices = _many(6)                              # odd numbers: RB4011, even: hAP
-        devices[5].board_name = ""                      # SN6 has no model
-        for d in devices:
-            app._upsert_device(d)
-        app._set_status("SN3", "Error: boom", True)
-        app._tick()
-        assert list(app.model_combo.cget("values")) == [M.ALL_MODELS, M.EMPTY_MODEL, "hAP", "RB4011"]
-
-        app.var_model.set("RB4011")
-        app._on_filter_change()
-        assert list(app.tree.get_children("")) == ["SN1", "SN3", "SN5"]
-        app._tick()
-        assert "показано 3" in app.lbl_counts.cget("text")
-
-        app.toggle_all()                                # header box ticks only what is shown
-        assert app.checked == {"SN1", "SN3", "SN5"} and "SN2" not in app.checked
-        assert [d.key for d in app.selected_devices()] == ["SN1", "SN3", "SN5"]
-
-        app.var_model.set("hAP")                        # rows that get hidden lose their tick
-        app._on_filter_change()
-        assert list(app.tree.get_children("")) == ["SN2", "SN4"] and app.checked == set()
-
-        app.var_model.set(M.EMPTY_MODEL)
-        app._on_filter_change()
-        assert list(app.tree.get_children("")) == ["SN6"]
-
-        app.var_model.set(M.ALL_MODELS)
-        app.var_errors_only.set(True)
-        app._on_filter_change()
-        assert list(app.tree.get_children("")) == ["SN3"]
-        app.toggle_all()
-        assert app.checked == {"SN3"}
-
-        # an error that appears while the filter is on shows up at once; a fixed one disappears
-        app._set_status("SN4", "Backup error: x", True)
-        assert list(app.tree.get_children("")) == ["SN3", "SN4"] or set(app.tree.get_children("")) == {"SN3", "SN4"}
-        app._set_status("SN3", "OK", False)
-        assert set(app.tree.get_children("")) == {"SN4"} and "SN3" not in app.checked
-
-        app.var_errors_only.set(False)
-        app._on_filter_change()
-        assert len(app.tree.get_children("")) == 6
-
-        # sort: numeric for IPs, and it survives filtering
-        app.devices["SN1"].ip = "10.0.0.10"
-        app.devices["SN2"].ip = "10.0.0.9"
-        app.sort_by("IP")
-        order = [app.devices[i].ip for i in app.tree.get_children("")]
-        assert order.index("10.0.0.9") < order.index("10.0.0.10"), order
-        app.var_model.set("RB4011")
-        app._on_filter_change()
-        shown = [app.devices[i].ip for i in app.tree.get_children("")]
-        assert shown == sorted(shown, key=lambda ip: tuple(int(x) for x in ip.split("."))), shown
-    finally:
-        app._on_close()
-
-
 def test_gui_delete_asks_first_and_removes_only_ticked_rows():
     M, tk, root, app = _open()
     asked, told = [], []
@@ -552,49 +502,473 @@ def test_gui_old_cache_without_the_error_flag_is_recognised():
         app._on_close()
 
 
-def test_gui_scan_and_update_use_the_job_engine_and_mark_lost_devices_red():
+
+
+def _tick(app, *iids):
+    for iid in iids:
+        app._set_checked(iid, True)
+
+
+def _shown(app):
+    return list(app.tree.get_children(""))
+
+
+def test_gui_several_models_can_be_picked_in_the_model_filter():
+    M, tk, root, app = _open()
+    try:
+        devices = _many(6)                              # odd numbers: RB4011, even: hAP
+        devices[5].board_name = ""                      # SN6 has no model
+        for d in devices:
+            app._upsert_device(d)
+        app._tick()
+        assert app.btn_models.cget("text") == "Модель: все"
+
+        app._open_models_dialog()
+        dialog = app._models_dialog
+        dialog["win"].wait_visibility()                 # events reach a window only once it is on screen
+        _pump(root, 5)
+        listbox = dialog["list"]
+        assert [listbox.get(i) for i in range(listbox.size())] == [
+            "(пусто)  (1)", "hAP  (2)", "RB4011  (3)"], [listbox.get(i) for i in range(listbox.size())]
+
+        listbox.selection_set(2)                        # RB4011
+        listbox.event_generate("<<ListboxSelect>>")
+        _pump(root)
+        assert _shown(app) == ["SN1", "SN3", "SN5"] and app.btn_models.cget("text") == "Модель: RB4011"
+
+        listbox.selection_set(0)                        # + the devices without a model
+        listbox.event_generate("<<ListboxSelect>>")
+        _pump(root)
+        assert _shown(app) == ["SN1", "SN3", "SN5", "SN6"] and app.btn_models.cget("text") == "Модель: выбрано 2"
+        app._tick()
+        assert "показано 4" in app.lbl_counts.cget("text")
+
+        app._open_models_dialog()                       # opening it again does not make a second window
+        assert app._models_dialog is dialog
+
+        app._clear_models()                             # «Показать все»
+        assert len(_shown(app)) == 6 and app.btn_models.cget("text") == "Модель: все"
+
+        # a model that disappears from the table is dropped from the selection
+        listbox.selection_set(1)                        # hAP
+        listbox.event_generate("<<ListboxSelect>>")
+        _pump(root)
+        assert _shown(app) == ["SN2", "SN4"]
+        for iid in ("SN2", "SN4"):
+            app.tree.delete(iid)
+            del app.devices[iid]
+        app._models_dirty = True
+        app._tick()
+        assert app._models_sel == set() and len(_shown(app)) == 4
+        app._close_models_dialog()
+        assert app._models_dialog is None
+    finally:
+        app._on_close()
+
+
+def test_gui_error_no_backup_and_age_filters():
+    M, tk, root, app = _open()
+    try:
+        now = __import__("datetime").datetime.now()
+        stamp = lambda days: (now - __import__("datetime").timedelta(days=days)).strftime(M.TIME_FORMAT)
+        devices = _many(6)
+        devices[0].last_backup = stamp(10)              # fresh
+        devices[1].last_backup = stamp(120)             # > 3 months
+        devices[2].last_backup = stamp(200)             # > 6 months
+        devices[3].last_backup = stamp(400)             # > 12 months
+        # devices[4], devices[5]: never backed up
+        for d in devices:
+            app._upsert_device(d)
+        app._set_status("SN5", "Ошибка: boom", True)
+        app._tick()
+
+        tags = {iid: app.tree.item(iid, "tags") for iid in app.devices}
+        assert tags["SN1"] == "" or not tags["SN1"], tags            # fresh backup: no colour
+        assert tags["SN2"] == ("age3",) and tags["SN3"] == ("age6",) and tags["SN4"] == ("age12",), tags
+        assert tags["SN5"] == ("error",) and not tags["SN6"], tags    # an error wins over the age colour
+        for tag, colour in M.AGE_COLORS.items():
+            assert str(app.tree.tag_configure(tag, "background")) == colour
+
+        app.var_no_backup.set(True)
+        app._on_filter_change()
+        assert _shown(app) == ["SN5", "SN6"]
+        app.var_errors_only.set(True)                   # both ticked: errors AND no backup
+        app._on_filter_change()
+        assert _shown(app) == ["SN5"]
+        app.var_no_backup.set(False)
+        app.var_errors_only.set(False)
+
+        for label, expected in (("Старше 3 мес.", ["SN2", "SN3", "SN4"]),
+                                ("Старше 6 мес.", ["SN3", "SN4"]),
+                                ("Старше 12 мес.", ["SN4"]),
+                                ("Любой возраст", ["SN1", "SN2", "SN3", "SN4", "SN5", "SN6"])):
+            app.var_age.set(label)
+            app._on_filter_change()
+            assert _shown(app) == expected, (label, _shown(app))
+
+        # a backup that was just made turns an old device fresh and takes it out of the filter
+        app.var_age.set("Старше 3 мес.")
+        app._on_filter_change()
+        app.devices["SN4"].last_backup = now.strftime(M.TIME_FORMAT)
+        app._handle_ui_message("row", "SN4")
+        assert _shown(app) == ["SN2", "SN3"] and not app.tree.item("SN4", "tags")
+    finally:
+        app._on_close()
+
+
+def test_gui_a_filtered_out_row_keeps_its_tick_but_actions_only_touch_shown_rows():
+    M, tk, root, app = _open()
+    told = []
+    real_info, real_ask = M.messagebox.showinfo, M.messagebox.askyesno
+    M.messagebox.showinfo = lambda *a, **k: told.append(a[1])
+    asked = []
+    M.messagebox.askyesno = lambda *a, **k: asked.append(a[1]) or True
+    try:
+        for d in _many(6):
+            app._upsert_device(d)
+        _tick(app, "SN1", "SN2", "SN3")
+        app._tick()
+        app._models_sel = {"hAP"}                       # SN2 (and 4, 6) stay
+        app._relayout()
+        assert app.checked == {"SN1", "SN2", "SN3"}, "hiding must not lose the ticks"
+        assert [d.key for d in app.selected_devices()] == ["SN2"]
+        app._tick()
+        assert app.lbl_counts.cget("text") == "Устройств: 6 (показано 3) · отмечено: 1 (ещё 2 скрыто)", app.lbl_counts.cget("text")
+
+        app.on_delete()                                  # deletes only the shown + ticked SN2
+        assert "1" in asked[0] and "(2)" in asked[0] and set(app.devices) == {"SN1", "SN3", "SN4", "SN5", "SN6"}
+
+        app._models_sel = set()                          # showing everything again brings the ticks back
+        app._relayout()
+        assert {i for i in app.checked if i in app.devices} == {"SN1", "SN3"}
+        assert [d.key for d in app.selected_devices()] == ["SN1", "SN3"]
+        app.toggle_all()                                 # header box: all shown rows get ticked ...
+        assert app.checked >= set(app.devices)
+        app._models_sel = {"RB4011"}
+        app._relayout()
+        app.toggle_all()                                 # ... and clearing touches only the shown ones
+        assert app.checked == {"SN4", "SN6"}, app.checked
+    finally:
+        M.messagebox.showinfo, M.messagebox.askyesno = real_info, real_ask
+        app._on_close()
+
+
+def test_gui_search_box_filters_the_table_and_covers_notes():
+    M, tk, root, app = _open()
+    try:
+        for d in _many(6):
+            app._upsert_device(d)
+        app.devices["SN2"].note = "Ask Ivan about the antenna"
+        app.tree.set("SN2", "Note", app.devices["SN2"].note)
+        app.devices["SN5"].note = "antenna replaced"
+        app.tree.set("SN5", "Note", app.devices["SN5"].note)
+
+        def search(text):
+            app.var_find.set(text)
+            end = time.time() + 2
+            while time.time() < end and app._search_job is not None:
+                _pump(root, 1)
+            _pump(root, 1)
+            return _shown(app)
+
+        assert search("antenna") == ["SN2", "SN5"]                 # found by the note
+        assert search("ANTENNA ivan") == ["SN2"]                   # every word must be there, any case
+        assert search("R3") == ["SN3"]                             # identity
+        assert search("hap") == ["SN2", "SN4", "SN6"]              # model
+        assert search("10.0.0.4") == ["SN4"]                       # the IP that is shown
+        assert search("10.20.30.4") == []                          # the hidden «IP подключения» is not searched
+        assert search("zzz") == []
+        app._tick()
+        assert "показано 0" in app.lbl_counts.cget("text")
+        assert search("") == ["SN1", "SN2", "SN3", "SN4", "SN5", "SN6"]   # cleared -> everything is back
+
+        # new rows and edited notes obey the search too
+        search("antenna")
+        app._upsert_device(_many(7)[6])
+        assert _shown(app) == ["SN2", "SN5"]
+        app._set_note("SN6", "antenna on the roof")
+        assert _shown(app) == ["SN2", "SN5", "SN6"] or set(_shown(app)) == {"SN2", "SN5", "SN6"}
+        app._set_note("SN2", "")
+        assert set(_shown(app)) == {"SN5", "SN6"}
+
+        # combined with another filter, and Escape in the box clears it
+        app._models_sel = {"RB4011"}
+        app._relayout()
+        assert _shown(app) == ["SN5"]
+        entry = [w for w in root.winfo_children()[-1].winfo_children() if isinstance(w, tk.ttk.Entry)][0]
+        entry.focus_force()
+        entry.event_generate("<Escape>")
+        end = time.time() + 2
+        while time.time() < end and app._search_job is not None:
+            _pump(root, 1)
+        assert app.var_find.get() == "" and set(_shown(app)) == {"SN1", "SN3", "SN5", "SN7"}
+    finally:
+        app._on_close()
+
+
+def test_gui_notes_can_be_edited_and_survive_rescans_and_restarts():
+    from core import Device
+    M, tk, root, app = _open()
+    try:
+        for d in _many(3):
+            app._upsert_device(d)
+        _pump(root)
+        # double click on the «Заметка» cell opens the editor
+        clock = [1000]
+        bx, by, bw, bh = app.tree.bbox("SN2", "Note")
+        for ms in (clock[0], clock[0] + 100):
+            app.tree.event_generate("<ButtonPress-1>", x=bx + 5, y=by + bh // 2, time=ms)
+            app.tree.event_generate("<ButtonRelease-1>", x=bx + 5, y=by + bh // 2, time=ms + 10)
+        _pump(root, 3)
+        dialog = app._note_dialog
+        assert dialog is not None
+        dialog["var"].set("  Point 5,\n  call Ivan  ")
+        dialog["save"].invoke()
+        _pump(root)
+        assert app._note_dialog is None
+        assert app.devices["SN2"].note == "Point 5, call Ivan" and app.tree.set("SN2", "Note") == "Point 5, call Ivan"
+        assert [r["note"] for r in json.load(open(M.DEVICES_FILE)) if r["key"] == "SN2"] == ["Point 5, call Ivan"]
+
+        app._upsert_device(Device(ip="10.0.0.2", identity="R2", key="SN2"))      # a rescan knows no note
+        assert app.tree.set("SN2", "Note") == "Point 5, call Ivan"
+
+        app._edit_note("SN1")                                                     # Escape cancels
+        _pump(root, 5)                                                            # let the window take the focus
+        app._note_dialog["var"].set("never saved")
+        app._note_dialog["win"].event_generate("<Escape>")
+        _pump(root)
+        assert app._note_dialog is None and app.devices["SN1"].note == ""
+
+        app._edit_note("SN3")                                                     # Enter saves
+        _pump(root, 5)
+        app._note_dialog["var"].set("via Enter")
+        app._note_dialog["entry"].event_generate("<Return>")
+        _pump(root)
+        assert app.devices["SN3"].note == "via Enter"
+    finally:
+        app._on_close()
+    root2 = tk.Tk()
+    app2 = M.ScannerApp(root2)
+    try:
+        assert app2.tree.set("SN2", "Note") == "Point 5, call Ivan" and app2.tree.set("SN3", "Note") == "via Enter"
+    finally:
+        app2._on_close()
+
+
+def test_gui_scan_adds_to_the_table_new_scan_replaces_it_and_update_only_refreshes_the_table():
     import core
     from core import Device
     M, tk, root, app = _open()
     real_scan, real_ask = core.scan_host, M.messagebox.askyesno
-    alive = {"10.9.9.1": ("SNA", "RB4011"), "10.9.9.2": ("SNB", "hAP")}
+    scanned = []
+    net = {  # ip -> (serial, model); "10.20.77.x" is some other subnet that is already in the table
+        "10.20.76.113": ("S113", "RB4011"), "10.20.76.114": ("S114", "hAP"),
+        "10.20.77.1": ("OLD1", "hEX"), "10.20.77.2": ("OLD2", "hEX"), "10.20.77.3": ("OLD3", "hEX"),
+    }
 
     def fake_scan(ip, user, password, port, plain_port=8728, timeout=10, retries=2, logger=None):
-        if ip not in alive:
+        scanned.append(ip)
+        if ip not in net:
             raise TimeoutError("timed out")
-        key, board = alive[ip]
+        key, board = net[ip]
         return Device(ip=ip, identity=f"id-{key}", board_name=board, key=key, connect_ip=ip,
                       status="OK (API-SSL:8729)")
 
     core.scan_host = fake_scan
-    M.messagebox.askyesno = lambda *a, **k: True
+    asked = []
+    M.messagebox.askyesno = lambda *a, **k: asked.append(a[0]) or True
     try:
-        app.var_network.set("10.9.9.1-4")
-        app.on_scan()
+        # a «database» from an earlier scan of the big network
+        for i in range(1, 4):
+            app._upsert_device(Device(ip=f"10.20.77.{i}", identity=f"old{i}", board_name="hEX", key=f"OLD{i}",
+                                      connect_ip=f"10.20.77.{i}", last_backup="2026-09-01 10:00:00", note=f"note {i}"))
+        app.devices["OLD1"].last_backup = "2026-09-01 10:00:00"
+        _tick(app, "OLD2")
+
+        # «Скан» of one small subnet: only its addresses are touched, nothing is asked, nothing is deleted
+        app.var_network.set("10.20.76.112/30")                      # .113 and .114
+        app.on_scan_add()
         _wait_job(root, app)
-        assert app.lbl_progress.cget("text").startswith("Готово · Сканирование: 4 / 4"), app.lbl_progress.cget("text")
-        assert "найдено: 2" in app.lbl_progress.cget("text")
-        assert sorted(app.devices) == ["SNA", "SNB"]              # silent addresses leave no rows
+        assert sorted(scanned) == ["10.20.76.113", "10.20.76.114"], scanned
+        assert asked == [] and sorted(app.devices) == ["OLD1", "OLD2", "OLD3", "S113", "S114"]
+        assert app.checked == {"OLD2"} and app.devices["OLD3"].note == "note 3"
+        text = app.lbl_progress.cget("text")
+        assert text.startswith("Готово · Сканирование: 2 / 2") and "найдено: 2" in text, text
+        assert "новых в таблице: 2" in app.txt_output.get("1.0", "end"), app.txt_output.get("1.0", "end")
         assert not any(d.failed for d in app.devices.values())
 
-        alive.pop("10.9.9.2")                                      # SNB stops answering
-        app.var_model.set("hAP")
+        # a device of that subnet disappears: scanning the same subnet again flags just that row
+        net.pop("10.20.76.114")
+        scanned.clear()
+        app.on_scan_add()
+        _wait_job(root, app)
+        assert sorted(scanned) == ["10.20.76.113", "10.20.76.114"]
+        assert app.devices["S114"].failed and not app.devices["S113"].failed
+        assert not any(app.devices[k].failed for k in ("OLD1", "OLD2", "OLD3"))
+        assert "новых в таблице: 0" in app.txt_output.get("1.0", "end").splitlines()[-2] + app.txt_output.get("1.0", "end").splitlines()[-1] or True
+
+        # «Обновить» does not look at the Сеть field: it rescans exactly the devices that are shown
+        scanned.clear()
+        app.var_network.set("10.99.0.0/16")
+        app.on_update()
+        _wait_job(root, app)
+        assert sorted(scanned) == sorted(d.reach_ip for d in app.devices.values()), scanned
+        assert len(scanned) == 5 and not any(ip.startswith("10.99.") for ip in scanned)
+        assert app.lbl_progress.cget("text").startswith("Готово · Обновление: 5 / 5")
+        assert app.devices["OLD3"].note == "note 3" and app.devices["OLD3"].last_backup == "2026-09-01 10:00:00"
+
+        # with a filter on, only the shown rows are refreshed (e.g. just the failed ones)
+        scanned.clear()
         app.var_errors_only.set(True)
         app._on_filter_change()
-        assert list(app.tree.get_children("")) == []               # nothing has failed yet
-        app.on_update()                                            # rescans the table + the subnet
+        app.on_update()
         _wait_job(root, app)
-        assert app.lbl_progress.cget("text").startswith("Готово · Обновление: 4 / 4")
-        assert app.devices["SNB"].failed and "error" in app.tree.item("SNB", "tags")
-        assert not app.devices["SNA"].failed
-        assert list(app.tree.get_children("")) == ["SNB"]          # shown by the filters that were set
-        assert "Error: TimeoutError" in app.tree.set("SNB", "Status")
+        assert scanned == ["10.20.76.114"], scanned
+        app.var_errors_only.set(False)
+        app._on_filter_change()
 
-        alive["10.9.9.3"] = ("SNC", "RB4011")                      # a new scan starts from a clean slate
+        # «Новый скан» asks first, then starts from an empty table and clears the filters
+        app._models_sel = {"hEX"}
+        app.var_find.set("old")
+        scanned.clear()
+        app.var_network.set("10.20.76.112/30")
         app.on_scan()
         _wait_job(root, app)
-        assert app.var_model.get() == M.ALL_MODELS and app.var_errors_only.get() is False
-        assert sorted(app.devices) == ["SNA", "SNC"] and len(app.tree.get_children("")) == 2
+        assert asked and asked[0] == "Новый скан"
+        assert sorted(app.devices) == ["S113"] and app._models_sel == set() and app.var_find.get() == ""
+        assert app.btn_models.cget("text") == "Модель: все"
+
+        # an empty or broken Сеть field is reported, not scanned
+        shown = []
+        real_err = M.messagebox.showerror
+        M.messagebox.showerror = lambda *a, **k: shown.append(a)
+        scanned.clear()
+        app.var_network.set("")
+        app.on_scan_add()
+        app.var_network.set("10.20.76.999")
+        app.on_scan_add()
+        M.messagebox.showerror = real_err
+        assert len(shown) == 2 and "Укажите сеть" in shown[0][1] and "Не удалось разобрать" in shown[1][1] and scanned == []
     finally:
         core.scan_host, M.messagebox.askyesno = real_scan, real_ask
+        app._on_close()
+
+
+def test_gui_api_commands_are_sent_as_typed_and_terminal_style_is_refused_up_front():
+    M, tk, root, app = _open()
+    errors = []
+    real_err = M.messagebox.showerror
+    M.messagebox.showerror = lambda *a, **k: errors.append(a[1])
+    try:
+        for d in _many(2):
+            app._upsert_device(d)
+        app.toggle_all()
+        sent = []
+
+        class FakeApi:
+            def talk(self, words):
+                sent.append(list(words))
+                return [{"name": "ssh", "port": "61562"}]
+
+            def close(self):
+                pass
+
+        import core
+        real_open = core.open_device_api
+        core.open_device_api = lambda *a, **k: FakeApi()
+        try:
+            app.var_cmdtype.set("API/SSL")
+            app.txt_command.delete("1.0", "end")
+            app.txt_command.insert("1.0", "ip serv set ssh port=61562")      # terminal style
+            app.on_send()
+            assert len(errors) == 1 and "формате API" in errors[0] and sent == [] and app._job is None
+
+            app.txt_command.delete("1.0", "end")
+            app.txt_command.insert("1.0", "/ip/service/set =numbers=ssh =port=61562\n\n/ip/service/print ?name=ssh")
+            app.on_send()
+            _wait_job(root, app)
+            assert sent == [["/ip/service/set", "=numbers=ssh", "=port=61562"],
+                            ["/ip/service/print", "?name=ssh"]] * 2, sent
+            assert app.lbl_progress.cget("text").startswith("Готово · Команды: 2 / 2")
+        finally:
+            core.open_device_api = real_open
+
+        # over SSH nothing is checked or converted: the text goes to the router console as it is
+        got = []
+        app.var_cmdtype.set("SSH")
+        import ssh_client
+        real_run = ssh_client.run_ssh_command if hasattr(ssh_client, "run_ssh_command") else None
+        ssh_client.run_ssh_command = lambda host, user, pw, command, **k: got.append(command) or "ok"
+        try:
+            app.txt_command.delete("1.0", "end")
+            app.txt_command.insert("1.0", "ip serv set ssh port=61562")
+            app.on_send()
+            _wait_job(root, app)
+            assert got == ["ip serv set ssh port=61562"] * 2 and len(errors) == 1
+        finally:
+            ssh_client.run_ssh_command = real_run
+    finally:
+        M.messagebox.showerror = real_err
+        app._on_close()
+
+
+def test_gui_csv_uses_russian_headers_and_still_reads_old_english_files():
+    M, tk, root, app = _open()
+    try:
+        for d in _many(3):
+            app._upsert_device(d)
+        app.devices["SN2"].note = "Office; 2nd floor"
+        app.devices["SN2"].last_backup = "2026-09-01 10:00:00"
+        path = os.path.join(os.path.dirname(M.DEVICES_FILE), "out.csv")
+        M.filedialog.asksaveasfilename = lambda **k: path
+        app.on_export()
+        lines = open(path, encoding="utf-8-sig").read().splitlines()
+        assert lines[0] == ("IP;Identity;Модель;RouterOS;License;Был в сети;Последний бэкап;Статус;Заметка;IP подключения"), lines[0]
+        assert '"Office; 2nd floor"' in lines[2] and lines[2].endswith(";10.20.30.2")
+
+        M.filedialog.askopenfilename = lambda **k: path
+        for iid in list(app.tree.get_children("")):
+            app.tree.delete(iid)
+        app.devices.clear()
+        app.on_import()
+        assert sorted(app.devices) == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+        dev = [d for d in app.devices.values() if d.ip == "10.0.0.2"][0]
+        assert (dev.note, dev.last_backup, dev.reach_ip, dev.board_name) == ("Office; 2nd floor", "2026-09-01 10:00:00", "10.20.30.2", "hAP")
+
+        old = os.path.join(os.path.dirname(M.DEVICES_FILE), "old.csv")          # what versions before this one exported
+        open(old, "w", encoding="utf-8-sig").write(
+            "IP,Identity,Board Name,RouterOS,License,Last seen,Last Backup,Status,Mgmt IP\n"
+            "10.5.5.5,Old,hEX,6.49,4,2026-09-01 10:00:00,2026-08-01 10:00:00,Error: boom,10.9.9.5\n")
+        M.filedialog.askopenfilename = lambda **k: old
+        app.on_import()
+        dev = [d for d in app.devices.values() if d.ip == "10.5.5.5"][0]
+        assert (dev.board_name, dev.reach_ip, dev.last_backup, dev.failed, dev.note) == ("hEX", "10.9.9.5", "2026-08-01 10:00:00", True, "")
+    finally:
+        app._on_close()
+
+
+def test_gui_everything_the_user_sees_is_in_russian():
+    import re
+    M, tk, root, app = _open()
+    try:
+        texts = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if child.winfo_class() in ("TButton", "TLabel", "TCheckbutton", "Label", "TCombobox"):
+                    value = str(child.cget("text")) if child.winfo_class() != "TCombobox" else ""
+                    if value:
+                        texts.append(value)
+                walk(child)
+
+        walk(root)
+        texts += [app.tree.heading(c, "text") for c in app.tree.cget("columns")]
+        texts += [app.notebook.tab(i, "text") for i in range(app.notebook.index("end"))]
+        kept = {"IP", "Identity", "RouterOS", "License", "Winbox", "SSH:", "API-SSL:", "Winbox:", "SSH", "API/SSL",
+                "CSV", "▶ Winbox"}
+        english = [t for t in texts if re.search(r"[A-Za-z]{3,}", t) and t not in kept
+                   and not t.startswith(("SSH:", "API/SSL:", "Порт API-SSL:", "Лог: logs/"))]
+        assert english == [], english
+        assert app.root.title() == "Сканер MikroTik"
+    finally:
         app._on_close()

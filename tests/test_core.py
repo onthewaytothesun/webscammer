@@ -12,10 +12,10 @@ from core import (  # noqa: E402
     bridge_ip,
     dedupe_devices,
     expand_targets,
-    parse_cli_to_api,
+    split_api_line,
     _is_auth_failure,
 )
-from routeros_api import RouterOSApi, RouterOSError  # noqa: E402
+from routeros_api import RouterOSApi, RouterOSAuthError, RouterOSError  # noqa: E402
 
 
 def test_expand_cidr():
@@ -34,22 +34,28 @@ def test_expand_dedups_overlap():
     assert hosts == ["10.0.0.1", "10.0.0.2"]
 
 
-def test_parse_cli_print():
-    assert parse_cli_to_api("/ip address print") == ["/ip/address/print"]
+def test_api_commands_are_sent_as_typed_without_conversion():
+    assert split_api_line("/ip/service/set =numbers=ssh =port=61562") == [
+        "/ip/service/set", "=numbers=ssh", "=port=61562"]
+    assert split_api_line("/ip/address/print ?interface=bridge1 .proplist=address") == [
+        "/ip/address/print", "?interface=bridge1", ".proplist=address"]
+    assert split_api_line('/system/identity/set =name="Point 5"') == ["/system/identity/set", "=name=Point 5"]
+    assert split_api_line("/system/reboot") == ["/system/reboot"]
+    assert split_api_line("   ") == []
 
 
-def test_parse_cli_with_args():
-    assert parse_cli_to_api("/system identity set name=r1") == [
-        "/system/identity/set",
-        "=name=r1",
-    ]
-
-
-def test_parse_cli_with_query():
-    assert parse_cli_to_api("/interface print ?disabled=yes") == [
-        "/interface/print",
-        "?disabled=yes",
-    ]
+def test_terminal_style_commands_are_refused_with_a_hint_not_rewritten():
+    for line in ("ip serv set ssh port=61562", "/ip service print", "/ip/service/set numbers=ssh"):
+        try:
+            split_api_line(line)
+            raise AssertionError(f"{line!r} should have been refused")
+        except ValueError as exc:
+            assert "формате API" in str(exc) and "SSH" in str(exc)
+    try:
+        split_api_line('/system/identity/set =name="open')
+        raise AssertionError("an unclosed quote should be refused")
+    except ValueError as exc:
+        assert "кавычк" in str(exc)
 
 
 def test_bridge_ip_picks_first_bridge1():
@@ -103,9 +109,9 @@ def test_length_encoding_roundtrip_boundaries():
 
 def test_auth_failure_detection():
     # a rejected login is definitive -> caller must not retry or fall back
-    assert _is_auth_failure(RouterOSError("login failed (check username/password)")) is True
+    assert _is_auth_failure(RouterOSAuthError("не удалось войти: проверьте логин и пароль")) is True
     # a mid-session drop is NOT an auth failure -> caller should retry
-    assert _is_auth_failure(RouterOSError("connection closed by router")) is False
+    assert _is_auth_failure(RouterOSError("роутер закрыл соединение")) is False
     assert _is_auth_failure(TimeoutError()) is False
 
 
@@ -240,6 +246,37 @@ def test_progress_text_helpers():
     assert progress_text("Сканирование", 45, 2048, 70, finished=True, stopped=True).startswith("Остановлено · Сканирование: 45 / 2048")
     assert progress_text("Команды", 4, 10, 30, paused=True).startswith("Пауза · Команды: 4 / 10 (40%)")
     assert "осталось" not in progress_text("Команды", 4, 10, 30, paused=True)
+    assert looks_like_error("Ошибка: TimeoutError") and looks_like_error("Ошибка бэкапа: x") \
+        and looks_like_error("Ошибка команды: x")
     assert looks_like_error("Error: TimeoutError") and looks_like_error("Backup error: x") \
-        and looks_like_error("Command error: x")
-    assert not looks_like_error("OK (API-SSL:8729)") and not looks_like_error("Backup: 10.0.0.1_error_x.rsc")
+        and looks_like_error("Command error: x")      # written by earlier versions
+    assert not looks_like_error("OK (API-SSL:8729)") and not looks_like_error("Бэкап: 10.0.0.1_error_x.rsc")
+
+
+def test_backup_age_colours_and_the_older_than_filter():
+    from datetime import datetime
+    from core import backup_age_tag, backup_older_than, months_before
+    now = datetime(2026, 10, 1, 12, 0, 0)
+    cases = {
+        "2026-09-29 10:00:00": "",         # fresh
+        "2026-07-01 12:00:00": "",         # exactly 3 months: not older yet
+        "2026-07-01 11:59:59": "age3",     # just over 3 months -> yellow
+        "2026-04-01 11:59:59": "age6",     # over 6 months -> orange
+        "2025-10-01 11:59:59": "age12",    # over 12 months -> red
+        "2024-01-01 00:00:00": "age12",
+        "": "",                            # no backup: handled by the "no backup" filter
+        "not a date": "",
+    }
+    for stamp, tag in cases.items():
+        assert backup_age_tag(stamp, now) == tag, (stamp, backup_age_tag(stamp, now))
+    assert backup_older_than("2026-04-01 11:59:59", 3, now) and not backup_older_than("2026-04-01 11:59:59", 12, now)
+    assert not backup_older_than("", 3, now)
+    assert months_before(datetime(2026, 3, 31), 1) == datetime(2026, 2, 28)     # month end is clamped
+    assert months_before(datetime(2026, 1, 15), 3) == datetime(2025, 10, 15)    # crosses the year
+
+
+def test_device_note_is_part_of_the_row_and_the_cache():
+    import dataclasses
+    row = Device(ip="1.1.1.1", note="Point 5, ask Ivan").as_row()
+    assert row["Note"] == "Point 5, ask Ivan" and list(row)[-1] == "Note"
+    assert dataclasses.asdict(Device(note="x"))["note"] == "x"

@@ -8,6 +8,7 @@ Kept free of tkinter so it can be unit tested headlessly.
 
 from __future__ import annotations
 
+import calendar
 import ipaddress
 import os
 import re
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
-from routeros_api import RouterOSApi, RouterOSError
+from routeros_api import RouterOSApi, RouterOSAuthError, RouterOSError
 
 BRIDGE_INTERFACE = "bridge1"
 
@@ -36,6 +37,7 @@ class Device:
     last_backup: str = ""
     status: str = ""
     failed: bool = False  # the last operation on this device failed (row turns red)
+    note: str = ""  # the operator's own comment, searchable
     # internal
     key: str = ""  # unique hardware key (serial) for de-duplication
     addresses: List[Dict[str, str]] = field(default_factory=list)
@@ -61,6 +63,7 @@ class Device:
             "Last seen": self.last_seen,
             "Last Backup": self.last_backup,
             "Status": self.status,
+            "Note": self.note,
         }
 
 
@@ -111,30 +114,29 @@ def expand_targets(spec: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# CLI -> API sentence conversion
+# Commands for Command Type = API/SSL: sent as they are, no conversion
 # ---------------------------------------------------------------------------
-def parse_cli_to_api(line: str) -> List[str]:
-    """Convert a RouterOS CLI-style line into an API sentence.
+def split_api_line(line: str) -> List[str]:
+    """One API sentence from one line, exactly as typed: words are split on
+    spaces (quotes keep a word with spaces together) and nothing is rewritten.
 
-    '/ip address print'              -> ['/ip/address/print']
-    '/system identity set name=r1'   -> ['/system/identity/set', '=name=r1']
-    '/interface print ?disabled=yes' -> ['/interface/print', '?disabled=yes']
+    '/ip/service/set =numbers=ssh =port=61562' -> ['/ip/service/set', '=numbers=ssh', '=port=61562']
+    Raises ValueError with a hint when the line is not written as an API command.
     """
-    tokens = shlex.split(line.strip())
-    if not tokens:
+    try:
+        words = shlex.split(line.strip())
+    except ValueError as exc:
+        raise ValueError(f"незакрытая кавычка в строке: {line.strip()}") from exc
+    if not words:
         return []
-    path_parts: List[str] = []
-    args: List[str] = []
-    for tok in tokens:
-        if tok.startswith("?") or tok.startswith("=") or "=" in tok:
-            if tok.startswith("?") or tok.startswith("="):
-                args.append(tok)
-            else:
-                args.append("=" + tok)
-        else:
-            path_parts.append(tok.strip("/"))
-    path = "/" + "/".join(path_parts)
-    return [path] + args
+    # API words after the command are attributes (=name=value), queries (?name=value)
+    # or API options (.tag=1, .proplist=...); a plain word means a terminal command
+    if not words[0].startswith("/") or not all(w[:1] in ("=", "?", ".") for w in words[1:]):
+        raise ValueError(
+            f"«{line.strip()}» — это не команда в формате API. В режиме API/SSL команда пишется "
+            f"так: /ip/service/set =numbers=ssh =port=61562. Обычные команды терминала "
+            f"выполняются в режиме SSH.")
+    return words
 
 
 # ---------------------------------------------------------------------------
@@ -265,11 +267,11 @@ def _collect_fields(api: RouterOSApi, dev: Device) -> None:
 
     if not (dev.identity or dev.board_name or dev.routeros):
         # every print was refused: don't report an empty row as "OK"
-        raise RouterOSError("router returned no data (check user permissions)")
+        raise RouterOSError("роутер не вернул данных (проверьте права пользователя)")
 
 
 def _is_auth_failure(exc: Exception) -> bool:
-    return isinstance(exc, RouterOSError) and "login failed" in str(exc).lower()
+    return isinstance(exc, RouterOSAuthError)
 
 
 def _try_plain_api(
@@ -314,7 +316,7 @@ def _poll_ssl_with_retries(
     (so the caller can try the next cipher profile), or the last transient
     error after exhausting retries.
     """
-    last_exc: Exception = RouterOSError("no attempt made")
+    last_exc: Exception = RouterOSError("не было ни одной попытки")
     for attempt in range(retries + 1):
         api = RouterOSApi(
             ip, username, password, port=api_ssl_port, use_ssl=True,
@@ -371,7 +373,7 @@ def scan_host(
       - login rejected (bad credentials)    -> surface immediately, no retry.
     Raises the last error if everything fails.
     """
-    last_exc: Exception = RouterOSError("no attempt made")
+    last_exc: Exception = RouterOSError("не было ни одной попытки")
     for ciphers, name in _CIPHER_PROFILES:
         try:
             if logger and ciphers is not None:
@@ -499,7 +501,7 @@ def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
             break
         time.sleep(0.5)
     if info is None:
-        raise RouterOSError("export file did not appear on the router")
+        raise RouterOSError("файл экспорта не появился на роутере")
 
     name = info.get("name", EXPORT_BASENAME + ".rsc")
     size = _parse_size(info.get("size", ""))
@@ -523,7 +525,7 @@ def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
             )
             if truncated:
                 raise ExportTooLarge(
-                    "config is %s bytes but RouterOS < 7.13 returns only %d over the API"
+                    "конфиг %s байт, а RouterOS старше 7.13 отдаёт по API только %d"
                     % (size if size is not None else ">4K", got)
                 )
     finally:
@@ -533,7 +535,7 @@ def fetch_export(api: RouterOSApi, timeout: float = 20.0, logger=None) -> str:
             pass  # cleanup is best effort
 
     if not text.strip():
-        raise RouterOSError("export came back empty")
+        raise RouterOSError("экспорт пустой")
     return text.replace("\r\n", "\n")
 
 
@@ -662,8 +664,50 @@ def progress_text(title: str, done: int, total: int, active_elapsed: float, *,
 
 
 def looks_like_error(status: str) -> bool:
-    """Old caches stored only the status text: recognise the failure ones."""
-    return (status or "").startswith(("Error", "Command error", "Backup error"))
+    """Old caches stored only the status text: recognise the failure ones
+    (current Russian texts and the English ones written by earlier versions)."""
+    return (status or "").startswith(("Ошибка", "Error", "Command error", "Backup error"))
+
+
+# ---------------------------------------------------------------------------
+# Age of the last backup (row colours and the "older than N months" filter)
+# ---------------------------------------------------------------------------
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+AGE_STEPS = (12, 6, 3)  # months, oldest first
+AGE_TAGS = {3: "age3", 6: "age6", 12: "age12"}
+
+
+def parse_time(text: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime((text or "").strip(), TIME_FORMAT)
+    except ValueError:
+        return None
+
+
+def months_before(moment: datetime, months: int) -> datetime:
+    """The same day-of-month `months` calendar months earlier (clamped to month end)."""
+    year, month = moment.year, moment.month - months
+    while month <= 0:
+        month += 12
+        year -= 1
+    day = min(moment.day, calendar.monthrange(year, month)[1])
+    return moment.replace(year=year, month=month, day=day)
+
+
+def backup_older_than(last_backup: str, months: int, now: Optional[datetime] = None) -> bool:
+    """True when the device has a backup and it is more than `months` months old.
+    No backup (or an unreadable date) is not "old": that is what the no-backup filter is for."""
+    taken = parse_time(last_backup)
+    return taken is not None and taken < months_before(now or datetime.now(), months)
+
+
+def backup_age_tag(last_backup: str, now: Optional[datetime] = None) -> str:
+    """Row colour class: '' (fresh or none), 'age3', 'age6' or 'age12'."""
+    now = now or datetime.now()
+    for months in AGE_STEPS:
+        if backup_older_than(last_backup, months, now):
+            return AGE_TAGS[months]
+    return ""
 
 
 def backup_filename(ip: str, identity: str, when: Optional[date] = None) -> str:

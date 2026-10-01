@@ -63,13 +63,13 @@ def test_diagnosis_tells_the_failure_kinds_apart():
         conn.close()
 
     port, _ = _serve(silent)
-    assert "no SSH banner" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=0.5)
+    assert "не присылает SSH-приветствие" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=0.5)
 
     port, _ = _serve(lambda conn, n: conn.close())
-    assert "closes the connection at once" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=1)
+    assert "сразу закрывает соединение" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=1)
 
     port, _ = _serve(lambda conn, n: (conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n"), conn.close()))
-    assert "not with SSH" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=1)
+    assert "не SSH" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=1)
 
     def banner_only(conn, n):
         conn.sendall(b"SSH-2.0-ROSSSH\r\n")
@@ -77,13 +77,13 @@ def test_diagnosis_tells_the_failure_kinds_apart():
         conn.close()
 
     port, _ = _serve(banner_only)
-    assert "before the key exchange" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=1)
+    assert "до обмена ключами" in ssh_client.diagnose_ssh("127.0.0.1", port, timeout=1)
 
     dead = socket.socket()
     dead.bind(("127.0.0.1", 0))
     free_port = dead.getsockname()[1]
     dead.close()
-    assert "TCP connect failed" in ssh_client.diagnose_ssh("127.0.0.1", free_port, timeout=1)
+    assert "TCP-подключение не удалось" in ssh_client.diagnose_ssh("127.0.0.1", free_port, timeout=1)
 
 
 def test_diagnosis_compares_the_devices_algorithms_with_ours():
@@ -99,14 +99,14 @@ def test_diagnosis_compares_the_devices_algorithms_with_ours():
         return _serve(behaviour)[0]
 
     text = ssh_client.diagnose_ssh("127.0.0.1", serve_kexinit(["diffie-hellman-group-from-the-stone-age"]), timeout=2)
-    assert "no common kex" in text and "diffie-hellman-group-from-the-stone-age" in text, text
+    assert "нет общих алгоритмов обмена ключами" in text and "diffie-hellman-group-from-the-stone-age" in text, text
 
     ours = ssh_client._our_algorithms()
     text = ssh_client.diagnose_ssh("127.0.0.1", serve_kexinit([ours["kex"][0]]), timeout=2)
-    if "no common" in text:   # the stub also offers fixed host key / cipher / MAC lists
-        assert "no common kex" not in text, text
+    if "нет общих" in text:   # the stub also offers fixed host key / cipher / MAC lists
+        assert "нет общих алгоритмов обмена ключами" not in text, text
     else:
-        assert "alive and shares algorithms" in text, text
+        assert "имеет общие с программой алгоритмы" in text, text
 
 
 def test_parse_kexinit_reads_the_four_lists():
@@ -142,7 +142,7 @@ def test_device_disconnect_reason_reaches_the_error_message():
         message = str(exc)
     assert "Negotiation failed" in message, message
     assert "Disconnect (code 3): no matching key exchange method found" in message, message
-    assert "diagnosis:" in message, message
+    assert "устройство завершило сессию" in message and "диагностика:" in message, message
 
 
 def test_a_dropped_handshake_is_retried_but_a_wrong_password_is_not():
@@ -187,14 +187,26 @@ def test_a_dropped_handshake_is_retried_but_a_wrong_password_is_not():
             ssh_client.run_ssh_command("127.0.0.1", "a", "pw", "/export", port=port, timeout=5, retries=0)
             raise AssertionError("no retries: should have failed")
         except ssh_client.SSHStageError as exc:
-            assert "banner" in str(exc) and "diagnosis:" in str(exc), str(exc)
+            assert "banner" in str(exc) and "диагностика:" in str(exc) and not exc.unreachable, str(exc)
 
         port, count = _serve(lambda conn, n: flaky(conn, 99))
         try:
             ssh_client.run_ssh_command("127.0.0.1", "a", "WRONG", "/export", port=port, timeout=5, retries=2)
             raise AssertionError("wrong password should fail")
         except ssh_client.SSHStageError as exc:
-            assert "check username/password" in str(exc) and "diagnosis" not in str(exc), str(exc)
+            assert "проверьте логин и пароль" in str(exc) and "диагностика" not in str(exc), str(exc)
         assert count[0] == 1, f"a rejected login must not be retried ({count[0]} connections)"
     finally:
         ssh_client.time.sleep = real_sleep
+
+
+def test_a_closed_or_silent_port_is_flagged_as_unreachable():
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    port = dead.getsockname()[1]
+    dead.close()
+    try:
+        ssh_client.run_ssh_command("127.0.0.1", "a", "b", "/export", port=port, timeout=2)
+        raise AssertionError("should have failed")
+    except ssh_client.SSHStageError as exc:
+        assert exc.unreachable and "отказал в соединении" in str(exc) and "диагностика" not in str(exc), str(exc)

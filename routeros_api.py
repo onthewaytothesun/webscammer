@@ -21,6 +21,10 @@ class RouterOSError(Exception):
     """Raised when the router returns a !trap / !fatal sentence."""
 
 
+class RouterOSAuthError(RouterOSError):
+    """The router rejected the username / password."""
+
+
 class RouterOSApi:
     def __init__(
         self,
@@ -171,7 +175,7 @@ class RouterOSApi:
         while len(buf) < n:
             chunk = self.sock.recv(n - len(buf))
             if not chunk:
-                raise RouterOSError("connection closed by router")
+                raise RouterOSError("роутер закрыл соединение")
             buf += chunk
         return buf
 
@@ -259,7 +263,7 @@ class RouterOSApi:
             try:
                 replies = self.talk(["/login"])
             except RouterOSError:
-                raise RouterOSError("login failed (check username/password)") from exc
+                raise RouterOSAuthError("не удалось войти: проверьте логин и пароль") from exc
 
         challenge_hex = ""
         for row in replies:
@@ -270,7 +274,7 @@ class RouterOSApi:
             if not modern_ok:
                 # the name/password login was refused and no challenge came
                 # back, so nothing authenticated us
-                raise RouterOSError("login failed (check username/password)")
+                raise RouterOSAuthError("не удалось войти: проверьте логин и пароль")
             self._log("debug", "%s login ok (plaintext)", self.host)
             return  # modern login already authenticated
 
@@ -285,4 +289,4 @@ class RouterOSApi:
             self.talk(["/login", "=name=" + self.username, "=response=" + response])
             self._log("debug", "%s login ok (legacy challenge)", self.host)
         except RouterOSError:
-            raise RouterOSError("login failed (check username/password)")
+            raise RouterOSAuthError("не удалось войти: проверьте логин и пароль")
