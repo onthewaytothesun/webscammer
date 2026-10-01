@@ -210,3 +210,41 @@ def test_a_closed_or_silent_port_is_flagged_as_unreachable():
         raise AssertionError("should have failed")
     except ssh_client.SSHStageError as exc:
         assert exc.unreachable and "отказал в соединении" in str(exc) and "диагностика" not in str(exc), str(exc)
+
+
+def test_ssh_inventory_retains_management_address_and_deduplicates_by_serial():
+    from unittest.mock import patch
+    from core import dedupe_devices
+    output = """RouterOS banner
+__MTSCAN__identity=Office = Main
+__MTSCAN__board_name=RB4011
+__MTSCAN__routeros=6.49.18 (stable)
+__MTSCAN__serial=ABC123
+__MTSCAN__license=5
+__MTSCAN__address=10.0.0.1/24|bridge1
+__MTSCAN__address=192.168.1.1/24|ether1
+"""
+    with patch.object(ssh_client, "run_ssh_command", return_value=output) as run:
+        dev = ssh_client.scan_host_ssh("192.168.1.1", "admin", "secret", port=2222, timeout=7, retries=2)
+    assert dev.identity == "Office = Main" and dev.board_name == "RB4011"
+    assert dev.routeros == "6.49.18 (stable)" and dev.license == "5" and dev.key == "ABC123"
+    assert dev.status == "OK (SSH:2222)"
+    dev = dedupe_devices([dev])[0]
+    assert dev.ip == "10.0.0.1" and dev.reach_ip == "192.168.1.1"
+    assert run.call_args.kwargs == {"port": 2222, "timeout": 7, "retries": 2}
+
+
+def test_ssh_inventory_supports_chr_and_rejects_empty_or_non_routeros_output():
+    from unittest.mock import patch
+    output = "__MTSCAN__routeros=7.16.2\n__MTSCAN__software_id=CHR-ID\n__MTSCAN__level=p1"
+    with patch.object(ssh_client, "run_ssh_command", return_value=output):
+        dev = ssh_client.scan_host_ssh("10.0.0.1", "admin", "secret")
+    assert dev.key == "CHR-ID" and dev.license == "p1"
+    for output in ("", "syntax error (line 1 column 3)", "Linux server", "__MTSCAN__serial=ABC"):
+        with patch.object(ssh_client, "run_ssh_command", return_value=output):
+            try:
+                ssh_client.scan_host_ssh("10.0.0.1", "admin", "secret")
+            except ssh_client.SSHStageError:
+                pass
+            else:
+                assert False, "must not mark failed inventory as OK"

@@ -1,7 +1,7 @@
 """
-SSH helper for SEND and Backup when Command Type = SSH (the scan itself is
-API-only). Requires paramiko (see requirements.txt); imported lazily so the
-API features work without it.
+SSH helper for inventory, SEND and Backup when Command Type = SSH.
+Requires paramiko (see requirements.txt); imported lazily so the API features
+work without it.
 
 paramiko 4+ dropped the SHA1 key exchanges and the ssh-rsa host key that
 RouterOS 6.x offers, so requirements.txt pins paramiko < 4.
@@ -312,3 +312,56 @@ def export_config(
     text = run_ssh_command(host, username, password, "/export", port=port,
                            timeout=timeout, retries=retries)
     return text.replace("\r\n", "\n")
+
+
+# Explicit markers avoid parsing RouterOS's human-oriented print tables, whose
+# columns and wrapping vary by terminal width/version. Optional properties may
+# be absent on CHR or older RouterOS, so each read is isolated with on-error.
+_INVENTORY_FIELDS = (
+    ("identity", "/system identity get name"),
+    ("board_name", "/system resource get board-name"),
+    ("routeros", "/system resource get version"),
+    ("serial", "/system routerboard get serial-number"),
+    ("model", "/system routerboard get model"),
+    ("license", "/system license get nlevel"),
+    ("level", "/system license get level"),
+    ("software_id", "/system license get software-id"),
+)
+_INVENTORY_SCRIPT = "; ".join(
+    ':do { :put ("__MTSCAN__' + key + '=" . [' + command + ']) } on-error={}'
+    for key, command in _INVENTORY_FIELDS
+) + '; :do { :foreach id in=[/ip address find] do={ :put ("__MTSCAN__address=" . ' \
+    '[/ip address get $id address] . "|" . [/ip address get $id interface]) } } on-error={}'
+
+
+def scan_host_ssh(host: str, username: str, password: str, port: int = 22,
+                  timeout: float = 10.0, retries: int = 2):
+    """Read RouterOS inventory in one SSH session without changing the router."""
+    from core import Device
+
+    output = run_ssh_command(host, username, password, _INVENTORY_SCRIPT,
+                             port=port, timeout=timeout, retries=retries)
+    fields, addresses = {}, []
+    for line in output.splitlines():
+        if not line.startswith("__MTSCAN__"):
+            continue
+        key, sep, value = line[len("__MTSCAN__"):].partition("=")
+        if not sep:
+            continue
+        if key == "address":
+            address, sep, interface = value.partition("|")
+            if sep:
+                addresses.append({"address": address, "interface": interface})
+        else:
+            fields[key] = value
+    dev = Device(
+        ip=host, connect_ip=host, identity=fields.get("identity", ""),
+        board_name=fields.get("board_name") or fields.get("model", ""),
+        routeros=fields.get("routeros", ""),
+        key=fields.get("serial") or fields.get("software_id", ""),
+        license=fields.get("license") or fields.get("level", ""),
+        addresses=addresses, status=f"OK (SSH:{port})",
+    )
+    if not (dev.identity or dev.board_name or dev.routeros):
+        raise SSHStageError("SSH: роутер не вернул данных RouterOS (проверьте права пользователя)")
+    return dev

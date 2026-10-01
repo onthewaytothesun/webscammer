@@ -1,5 +1,5 @@
 # Scan and API features use only the Python standard library.
-# paramiko is needed only for Command Type = SSH (SEND / Backup over SSH).
+# paramiko is needed only for Command Type = SSH (scan / refresh / SEND / Backup over SSH).
 # paramiko 4+ removed the SHA1 key exchanges / ssh-rsa host key that
 # RouterOS 6.x offers, so it cannot connect to older routers.
 paramiko>=2.7,<4
