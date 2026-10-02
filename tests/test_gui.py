@@ -146,7 +146,8 @@ def test_gui_right_click_copies_cell_or_row():
         def right_click(iid, col):
             bx, by, bw, bh = app.tree.bbox(iid, col)
             posted.clear()
-            app.tree.event_generate("<Button-3>", x=bx + 5, y=by + bh // 2)
+            event = "<Button-2>" if root.tk.call("tk", "windowingsystem") == "aqua" else "<Button-3>"
+            app.tree.event_generate(event, x=bx + 5, y=by + bh // 2)
             _pump(root, 2)
             return posted[-1]
 
@@ -970,5 +971,74 @@ def test_gui_everything_the_user_sees_is_in_russian():
                    and not t.startswith(("SSH:", "API/SSL:", "Порт API-SSL:", "Лог: logs/"))]
         assert english == [], english
         assert app.root.title() == "Сканер MikroTik"
+    finally:
+        app._on_close()
+
+
+def test_gui_ten_command_tabs_send_selected_text_and_persist_all_drafts():
+    from unittest.mock import patch
+    M, tk, root, app = _open()
+    try:
+        tabs = app.notebook.tabs()
+        assert len(tabs) == 11, "ten command tabs plus the output tab"
+        assert app.notebook.tab(tabs[-1], "text") == "Вывод / Лог"
+        for i in range(10):
+            app.notebook.select(i)
+            _pump(root, 1)
+            app.txt_command.insert("1.0", f":put {i + 1}")
+        app.var_cmdtype.set("SSH")
+        app._upsert_device(_devices()[0])
+        app.toggle_all()
+        app.notebook.select(6)
+        _pump(root, 1)
+        with patch("ssh_client.run_ssh_command", return_value="7") as run:
+            app.on_send()
+            _wait_job(root, app)
+            assert run.call_args.args[3] == ":put 7"
+            assert app.notebook.index(app.notebook.select()) == 10
+            app.on_send()  # output tab must retain the last command selection
+            _wait_job(root, app)
+            assert run.call_args.args[3] == ":put 7"
+        app._save_settings()
+        for widget in app.command_editors:
+            widget.delete("1.0", "end")
+        app._load_settings()
+        for i, widget in enumerate(app.command_editors):
+            assert widget.get("1.0", "end-1c") == f":put {i + 1}"
+        assert app.txt_command.get("1.0", "end-1c") == ":put 7"
+        with open(M.SETTINGS_FILE, "w") as fh:
+            json.dump({"command": "/system resource print"}, fh)
+        app._load_settings()
+        assert app.command_editors[0].get("1.0", "end-1c") == "/system resource print"
+        assert all(w.get("1.0", "end-1c") == "" for w in app.command_editors[1:])
+    finally:
+        app._on_close()
+
+
+def test_gui_ssh_scan_and_refresh_use_selected_transport():
+    from unittest.mock import patch
+    M, tk, root, app = _open()
+    try:
+        app.var_cmdtype.set("SSH")
+        app.var_ssh_port.set("2222")
+        app.var_network.set("192.168.1.1")
+        reply = "__MTSCAN__identity=SSH router\n__MTSCAN__serial=SSH1\n__MTSCAN__address=10.0.0.1/24|bridge1"
+        with patch("ssh_client.run_ssh_command", return_value=reply) as run, patch(
+                "core.scan_host", side_effect=AssertionError("SSH scan must not use API")):
+            app.on_scan_add()
+            _wait_job(root, app)
+            assert app.devices["SSH1"].identity == "SSH router"
+            assert app.devices["SSH1"].reach_ip == "192.168.1.1"
+            assert run.call_args.kwargs["port"] == 2222
+            app.on_update()
+            _wait_job(root, app)
+            assert run.call_count == 2
+            app.on_update_one("SSH1")
+            for _ in range(30):
+                _pump(root, 1)
+                if run.call_count == 3:
+                    break
+            assert run.call_count == 3
+            assert run.call_args.args[0] == "192.168.1.1"
     finally:
         app._on_close()

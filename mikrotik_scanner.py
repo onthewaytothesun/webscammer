@@ -3,7 +3,7 @@
 MikroTik subnet scanner & manager.
 
 A Tkinter desktop tool that scans a subnet for MikroTik / RouterOS devices,
-authenticates with operator-supplied credentials over the RouterOS API
+authenticates with operator-supplied credentials over SSH or the RouterOS API
 (API-SSL, with plain API as a fallback), inventories them, runs commands on selected
 devices, and saves textual (.rsc) backups. The interface is in Russian.
 
@@ -190,11 +190,27 @@ class ScannerApp:
         # copy/paste for entries and log, independent of keyboard layout
         self._install_clipboard_bindings()
 
-        # two rows: with Russian labels one row does not fit into a 1280 px window
-        form = ttk.Frame(self.root, padding=(6, 6, 6, 0))
-        form.pack(fill=X)
-        form2 = ttk.Frame(self.root, padding=(6, 4, 6, 4))
-        form2.pack(fill=X)
+        # Keep all input fields in one row. On narrow windows the row scrolls
+        # horizontally instead of wrapping or hiding the rightmost inputs.
+        form_host = ttk.Frame(self.root)
+        form_host.pack(fill=X)
+        form_canvas = tk.Canvas(form_host, height=36, highlightthickness=0)
+        form_canvas.pack(fill=X)
+        form_scroll = ttk.Scrollbar(form_host, orient="horizontal", command=form_canvas.xview)
+        form_canvas.configure(xscrollcommand=form_scroll.set)
+        form = ttk.Frame(form_canvas, padding=(6, 4))
+        form_canvas.create_window((0, 0), window=form, anchor="nw")
+
+        def resize_form(_event=None):
+            form_canvas.configure(scrollregion=form_canvas.bbox("all"), height=form.winfo_reqheight())
+            if form.winfo_reqwidth() > form_canvas.winfo_width():
+                form_scroll.pack(fill=X)
+            else:
+                form_scroll.pack_forget()
+                form_canvas.xview_moveto(0)
+
+        form.bind("<Configure>", resize_form)
+        form_canvas.bind("<Configure>", resize_form)
 
         def field(parent, label, var, width, show=None):
             ttk.Label(parent, text=label).pack(side=LEFT, padx=(4, 2))
@@ -203,22 +219,21 @@ class ScannerApp:
             self._attach_context_menu(e)
             return e
 
-        field(form, "Логин:", self.var_user, 14)
-        field(form, "Пароль:", self.var_pass, 14, show="*")
-        field(form, "Сеть:", self.var_network, 26)
-        # how SEND and Backup talk to the router; the scan always uses the API
+        field(form, "Логин:", self.var_user, 10)
+        field(form, "Пароль:", self.var_pass, 10, show="*")
+        field(form, "Сеть:", self.var_network, 22)
+        # transport for scanning, refreshing, SEND and Backup
         ttk.Label(form, text="Тип команд:").pack(side=LEFT, padx=(10, 2))
         ttk.Combobox(
             form, textvariable=self.var_cmdtype, values=["API/SSL", "SSH"],
             width=8, state="readonly",
         ).pack(side=LEFT)
-        ttk.Checkbutton(form, text="Запомнить настройки", variable=self.var_save).pack(side=LEFT, padx=(12, 2))
-        field(form2, "Порт API-SSL:", self.var_api_port, 6)
-        field(form2, "SSH:", self.var_ssh_port, 6)
-        field(form2, "Winbox:", self.var_winbox_port, 6)
-        field(form2, "Потоки:", self.var_threads, 5)
-        field(form2, "Таймаут, с:", self.var_timeout, 4)
-        field(form2, "Повторы:", self.var_retries, 3)
+        field(form, "API-SSL:", self.var_api_port, 6)
+        field(form, "SSH:", self.var_ssh_port, 6)
+        field(form, "Winbox:", self.var_winbox_port, 6)
+        field(form, "Потоки:", self.var_threads, 5)
+        field(form, "Таймаут, с:", self.var_timeout, 4)
+        field(form, "Повторы:", self.var_retries, 3)
 
         # buttons row
         actions = ttk.Frame(self.root, padding=(6, 0))
@@ -234,21 +249,27 @@ class ScannerApp:
         ttk.Button(actions, text="Обновить", command=self.on_update).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Удалить", command=self.on_delete).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Бэкап", command=self.on_backup).pack(side=LEFT, padx=2)
-        ttk.Label(actions, text="Команда:").pack(side=RIGHT, padx=(2, 4))
+        ttk.Checkbutton(actions, text="Запомнить настройки", variable=self.var_save).pack(side=LEFT, padx=12)
         ttk.Button(actions, text="Отправить", command=self.on_send).pack(side=RIGHT, padx=2)
 
-        # command / output notebook (single big box, two tabs)
+        # Ten independent command drafts, followed by the output tab on the right.
         nb = ttk.Notebook(self.root)
         nb.pack(fill=BOTH, expand=False, padx=6, pady=4)
         from tkinter.scrolledtext import ScrolledText
 
-        cmd_frame = ttk.Frame(nb)
-        self.lbl_hint = ttk.Label(cmd_frame, anchor="w", foreground="#555555")
-        self.lbl_hint.pack(fill=X, padx=2)
-        self.txt_command = ScrolledText(cmd_frame, height=8, wrap="word")
-        self.txt_command.pack(fill=BOTH, expand=True)
-        self._attach_context_menu(self.txt_command)
-        nb.add(cmd_frame, text="Команда")
+        self.command_editors = []
+        self.command_hints = []
+        self.active_command = 0
+        for i in range(10):
+            cmd_frame = ttk.Frame(nb)
+            hint = ttk.Label(cmd_frame, anchor="w", foreground="#555555")
+            hint.pack(fill=X, padx=2)
+            editor = ScrolledText(cmd_frame, height=8, wrap="word")
+            editor.pack(fill=BOTH, expand=True)
+            self._attach_context_menu(editor)
+            self.command_editors.append(editor)
+            self.command_hints.append(hint)
+            nb.add(cmd_frame, text=f"Команда {i + 1}")
         self.var_cmdtype.trace_add("write", lambda *_: self._update_command_hint())
         self._update_command_hint()
 
@@ -258,6 +279,7 @@ class ScannerApp:
         self._make_readonly(self.txt_output)  # selectable & copyable, not editable
         nb.add(out_frame, text="Вывод / Лог")
         self.notebook = nb
+        nb.bind("<<NotebookTabChanged>>", self._command_tab_changed)
 
         # progress: bar, then what is running / how far / how long is left,
         # and on the right what the row colours mean
@@ -344,7 +366,19 @@ class ScannerApp:
         ttk.Button(bottom, text="Импорт", command=self.on_import).pack(side=RIGHT, padx=2)
 
     def _update_command_hint(self) -> None:
-        self.lbl_hint.configure(text=COMMAND_HINTS.get(self.var_cmdtype.get(), ""))
+        for hint in self.command_hints:
+            hint.configure(text=COMMAND_HINTS.get(self.var_cmdtype.get(), ""))
+
+    def _command_tab_changed(self, _event=None) -> None:
+        index = self.notebook.index(self.notebook.select())
+        if index < len(self.command_editors):
+            self.active_command = index
+
+    @property
+    def txt_command(self):
+        # Read selection synchronously too: the tab event may still be queued.
+        self._command_tab_changed()
+        return self.command_editors[self.active_command]
 
     # ---------------------------------------------------- clipboard helpers
     # Physical key codes of C / V / X / A. Tk binds only the Latin keysyms, so on
@@ -1052,11 +1086,7 @@ class ScannerApp:
         def work():
             ip = dev.reach_ip
             try:
-                fresh = core.scan_host(
-                    ip, cfg["user"], cfg["password"],
-                    cfg["api_ssl_port"], plain_port=8728,
-                    timeout=cfg["timeout"], retries=cfg["retries"], logger=self.logger,
-                )
+                fresh = self._poll_host(ip, cfg)
                 fresh = dedupe_devices([fresh])[0]  # keep bridge1 as the shown IP
                 fresh.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.log(f"{ip}: обновлено {fresh.identity or fresh.board_name} [{fresh.status}]")
@@ -1347,6 +1377,15 @@ class ScannerApp:
                         "Примеры: 192.168.0.0/24, 10.20.76.112/28, 192.168.0.10-20, 192.168.0.5")
             return None
 
+    def _poll_host(self, ip: str, cfg: dict) -> Device:
+        if cfg["cmdtype"] == "SSH":
+            from ssh_client import scan_host_ssh
+            return scan_host_ssh(ip, cfg["user"], cfg["password"], port=cfg["ssh_port"],
+                                 timeout=cfg["timeout"], retries=cfg["retries"])
+        return core.scan_host(ip, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+                              plain_port=8728, timeout=cfg["timeout"], retries=cfg["retries"],
+                              logger=self.logger)
+
     def _start_scan(self, targets: list[str], kind: str) -> None:
         self._maybe_save_settings()
         cfg = self._read_config()
@@ -1359,12 +1398,7 @@ class ScannerApp:
 
         def scan_one(ip: str) -> bool:
             try:
-                dev = core.scan_host(
-                    ip, cfg["user"], cfg["password"],
-                    cfg["api_ssl_port"], plain_port=8728,
-                    timeout=cfg["timeout"], retries=cfg["retries"],
-                    logger=self.logger,
-                )
+                dev = self._poll_host(ip, cfg)
                 dev.last_seen = datetime.now().strftime(TIME_FORMAT)
                 self.log(f"{ip}: найдено {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
@@ -1385,9 +1419,10 @@ class ScannerApp:
             self.ui_queue.put(("done", dedupe_devices(found)))
 
         scanning = kind != "Обновление"
+        transport = (f"SSH {cfg['ssh_port']}" if cfg["cmdtype"] == "SSH" else
+                     f"API-SSL {cfg['api_ssl_port']} (обычный API 8728 — если порт закрыт)")
         self.log(f"{kind}: адресов {len(targets)}, потоков {cfg['threads']}, "
-                 f"таймаут {cfg['timeout']:g} с, повторов {cfg['retries']}, порт API-SSL {cfg['api_ssl_port']} "
-                 f"(обычный API 8728 — только если этот порт закрыт).")
+                 f"таймаут {cfg['timeout']:g} с, повторов {cfg['retries']}, {transport}.")
         self._start_job("Сканирование" if scanning else "Обновление", targets, scan_one, cfg["threads"],
                         ok_label="найдено", on_finish=finish,
                         extra={"new": 0} if scanning else None)
@@ -1419,7 +1454,7 @@ class ScannerApp:
             return
         command = self.txt_command.get("1.0", END).strip()
         if not command:
-            messagebox.showinfo("Отправить", "Введите команду на вкладке «Команда».")
+            messagebox.showinfo("Отправить", "Введите команду на одной из вкладок «Команда 1–10».")
             return
         cfg = self._read_config()
         if cfg["cmdtype"] != "SSH":
@@ -1431,7 +1466,7 @@ class ScannerApp:
             except ValueError as exc:
                 messagebox.showerror("Отправить", str(exc))
                 return
-        self.notebook.select(1)  # show output tab
+        self.notebook.select(len(self.command_editors))  # show output tab
         self.log(f"Отправка ({cfg['cmdtype']}): устройств {len(devices)}, одновременно {self._ops_threads(cfg)}")
         self._start_job("Команды", devices, lambda dev: self._send_one(dev, command, cfg),
                         self._ops_threads(cfg), ok_label="успешно", bad_label="ошибок")
@@ -1732,6 +1767,7 @@ class ScannerApp:
                 self.log(f"Не удалось удалить сохранённые настройки: {exc}")
 
     def _save_settings(self) -> None:
+        self._command_tab_changed()
         data = {}
         try:
             with open(SETTINGS_FILE, encoding="utf-8") as fh:
@@ -1748,9 +1784,11 @@ class ScannerApp:
             "cmdtype": self.var_cmdtype.get(),
             "timeout": self.var_timeout.get(),
             "retries": self.var_retries.get(),
-            "command": self.txt_command.get("1.0", END).rstrip(),
+            "commands": [editor.get("1.0", "end-1c") for editor in self.command_editors],
+            "active_command": self.active_command,
             "save": True,
         })
+        data.pop("command", None)  # migrated to ten independent drafts
         # Password is stored only when Save is ticked; base64 is obfuscation,
         # not encryption — the file is local to the operator's machine.
         data["password"] = base64.b64encode(self.var_pass.get().encode()).decode()
@@ -1783,8 +1821,16 @@ class ScannerApp:
                 self.var_pass.set(base64.b64decode(data["password"]).decode())
             except Exception:  # noqa: BLE001
                 pass
-        if data.get("command"):
-            self.txt_command.insert("1.0", data["command"])
+        commands = data.get("commands")
+        if not isinstance(commands, list):
+            commands = [data.get("command", "")]
+        for i, editor in enumerate(self.command_editors):
+            editor.delete("1.0", END)
+            if i < len(commands) and isinstance(commands[i], str):
+                editor.insert("1.0", commands[i])
+        active = data.get("active_command", 0)
+        self.active_command = active if isinstance(active, int) and 0 <= active < 10 else 0
+        self.notebook.select(self.active_command)
 
     def _on_close(self) -> None:
         self.stop_event.set()
