@@ -137,6 +137,8 @@ class ScannerApp:
         self.var_age = StringVar(value=AGE_CHOICES[0][0])
 
         self._build_ui()
+        self._fit_window_to_fields()
+        self._set_app_icon()
         self._load_settings()
         self._load_devices()
         self._after_id = self.root.after(100, self._drain_queue)
@@ -201,6 +203,7 @@ class ScannerApp:
         form_canvas.configure(xscrollcommand=form_scroll.set)
         form = ttk.Frame(form_canvas, padding=(3, 4))
         form_canvas.create_window((0, 0), window=form, anchor="nw")
+        self._field_row = form
 
         def resize_form(_event=None):
             form_canvas.configure(scrollregion=form_canvas.bbox("all"), height=form.winfo_reqheight())
@@ -250,24 +253,28 @@ class ScannerApp:
             watch(e)
             return e
 
-        # compact widths so the whole row fits a 1280 px window
+        # compact widths so the whole row fits the window
         field(form, "Логин:", self.var_user, 9)
         field(form, "Пароль:", self.var_pass, 9, show="*")
         field(form, "Сеть:", self.var_network, 15)
-        # transport for scanning, refreshing, SEND and Backup
-        ttk.Label(form, text="Тип команд:").pack(side=LEFT, padx=(5, 1))
-        cmdtype_box = ttk.Combobox(
-            form, textvariable=self.var_cmdtype, values=["API/SSL", "SSH"],
-            width=7, state="readonly",
-        )
-        cmdtype_box.pack(side=LEFT)
-        watch(cmdtype_box)
         field(form, "API-SSL:", self.var_api_port, 5)
         field(form, "SSH:", self.var_ssh_port, 5)
         field(form, "Winbox:", self.var_winbox_port, 5)
         field(form, "Потоки:", self.var_threads, 3)
         field(form, "Таймаут:", self.var_timeout, 3)
         field(form, "Повторы:", self.var_retries, 2)
+        # on the right: the transport for scanning, refreshing, SEND and Backup,
+        # then «Запомнить настройки»
+        ttk.Label(form, text="Тип команд:").pack(side=LEFT, padx=(10, 1))
+        cmdtype_box = ttk.Combobox(
+            form, textvariable=self.var_cmdtype, values=["API/SSL", "SSH"],
+            width=7, state="readonly",
+        )
+        cmdtype_box.pack(side=LEFT)
+        watch(cmdtype_box)
+        save_box = ttk.Checkbutton(form, text="Запомнить настройки", variable=self.var_save)
+        save_box.pack(side=LEFT, padx=(10, 2))
+        watch(save_box)
 
         # buttons row
         actions = ttk.Frame(self.root, padding=(6, 0))
@@ -283,7 +290,7 @@ class ScannerApp:
         ttk.Button(actions, text="Обновить", command=self.on_update).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Удалить", command=self.on_delete).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Бэкап", command=self.on_backup).pack(side=LEFT, padx=2)
-        ttk.Checkbutton(actions, text="Запомнить настройки", variable=self.var_save).pack(side=LEFT, padx=12)
+        ttk.Label(actions, text="Команда:").pack(side=RIGHT, padx=(2, 4))
         ttk.Button(actions, text="Отправить", command=self.on_send).pack(side=RIGHT, padx=2)
 
         # Ten independent command drafts, followed by the output tab on the right.
@@ -398,6 +405,23 @@ class ScannerApp:
                   foreground="#666").pack(side=LEFT)
         ttk.Button(bottom, text="Экспорт", command=self.on_export).pack(side=RIGHT, padx=2)
         ttk.Button(bottom, text="Импорт", command=self.on_import).pack(side=RIGHT, padx=2)
+
+    def _fit_window_to_fields(self) -> None:
+        """Open the window wide enough for the whole field row when the screen
+        allows it; on a narrower screen the row scrolls instead."""
+        self.root.update_idletasks()
+        needed = self._field_row.winfo_reqwidth() + 16
+        screen = self.root.winfo_screenwidth()
+        width = max(1320, min(needed, screen - 40))
+        self.root.geometry(f"{width}x820")
+
+    def _set_app_icon(self) -> None:
+        """Window / taskbar icon: a white «M» on a router-blue tile, drawn in code."""
+        try:
+            self._app_icons = [tk.PhotoImage(data=icons.app_icon(size)[2]) for size in (64, 32, 16)]
+            self.root.iconphoto(True, *self._app_icons)
+        except tk.TclError:
+            pass   # an icon is cosmetic: never let it stop the program
 
     def _update_command_hint(self) -> None:
         for hint in self.command_hints:

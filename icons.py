@@ -184,3 +184,35 @@ def row_icon(size: int, checked: bool) -> Tuple[int, int, str]:
 def header_icon(size: int, checked: bool) -> Tuple[int, int, str]:
     """Just the check-all box, for the column heading."""
     return size, size, png_base64(size, size, render(size, size, checkbox_shapes(0, 0, size, checked)))
+
+
+# ----------------------------------------------------------- application icon
+TILE: Color = (22, 52, 96)        # dark router blue
+LED: Color = (88, 214, 141)       # status-light green
+
+
+def app_icon_shapes(size: float) -> List[Shape]:
+    """A bold white «M» on a rounded dark-blue tile, with three status lights
+    under it (a nod to a router's front panel). Drawn here, not a vendor logo."""
+    s = size
+    tile = _rounded_rect(0.5, 0.5, s - 0.5, s - 0.5, s * 0.2)
+    w = s * 0.13                                   # stroke width of the letter
+    top, bottom = s * 0.20, s * 0.66
+    left, right = s * 0.22, s * 0.78
+    middle = (s * 0.5, s * 0.50)
+    letter = [
+        _segment(left, top, left, bottom, w),
+        _segment(left, top, *middle, w),
+        _segment(*middle, right, top, w),
+        _segment(right, top, right, bottom, w),
+    ]
+    shapes: List[Shape] = [(TILE, tile)] + [(WHITE, part) for part in letter]
+    r = max(s * 0.045, 0.9)
+    for cx in (s * 0.36, s * 0.5, s * 0.64):
+        shapes.append((LED, _rounded_rect(cx - r, s * 0.80 - r, cx + r, s * 0.80 + r, r)))
+    return shapes
+
+
+def app_icon(size: int) -> Tuple[int, int, str]:
+    """The window / taskbar icon at `size` px -> (w, h, base64 PNG)."""
+    return size, size, png_base64(size, size, render(size, size, app_icon_shapes(size)))

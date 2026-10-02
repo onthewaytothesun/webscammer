@@ -62,3 +62,9 @@ def test_header_icon_is_just_the_box():
     w, h, b64 = icons.header_icon(20, True)
     assert (w, h) == (20, 20)
     assert _decode(b64)[2](10, 4)[:3] in (icons.ACCENT, icons.WHITE)
+
+
+def test_app_icon_is_an_opaque_tile_in_all_sizes():
+    for size in (16, 32, 64):
+        w, h, data = icons.app_icon(size)
+        assert (w, h) == (size, size) and data

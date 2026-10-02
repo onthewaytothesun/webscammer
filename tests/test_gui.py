@@ -1120,11 +1120,13 @@ def test_gui_command_drafts_are_kept_without_remember_settings_and_log_names_the
 def test_gui_the_field_row_fits_and_a_focused_field_is_scrolled_into_view():
     M, tk, root, app = _open()
     try:
-        root.geometry("1280x500")
+        app._fit_window_to_fields()               # the window opens wide enough for the whole field row
         _pump(root, 5)
         form_canvas = root.winfo_children()[0].winfo_children()[0]
         form = form_canvas.winfo_children()[0]
-        assert form.winfo_reqwidth() <= 1280, form.winfo_reqwidth()
+        needed = form.winfo_reqwidth()
+        assert needed > 0
+        assert root.winfo_width() >= min(needed + 16, root.winfo_screenwidth() - 40) - 4, (needed, root.winfo_width())
 
         root.geometry("700x500")                  # a narrow window: the row scrolls instead of hiding fields
         _pump(root, 5)
@@ -1137,5 +1139,20 @@ def test_gui_the_field_row_fits_and_a_focused_field_is_scrolled_into_view():
         entries[0].focus_force()
         _pump(root, 5)
         assert form_canvas.canvasx(0) <= entries[0].winfo_x()
+    finally:
+        app._on_close()
+
+
+def test_gui_command_type_and_save_box_end_the_field_row_and_send_has_its_label():
+    M, tk, root, app = _open()
+    try:
+        _pump(root, 5)
+        form_canvas = root.winfo_children()[0].winfo_children()[0]
+        form = form_canvas.winfo_children()[0]
+        kids = form.pack_slaves()
+        texts = [str(w.cget("text")) if "text" in w.keys() else "" for w in kids]
+        assert texts[-1] == "Запомнить настройки", texts
+        assert "Тип команд:" in texts[-3], texts
+        assert app._app_icons
     finally:
         app._on_close()
