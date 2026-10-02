@@ -6,3 +6,4 @@ ui.json
 *.tmp
 Backups/
 logs/
+commands.json

@@ -47,6 +47,7 @@ from core import Device, backup_filename, dedupe_devices, expand_targets, split_
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+COMMANDS_FILE = os.path.join(APP_DIR, "commands.json")  # the 10 command drafts, kept always
 DEVICES_FILE = os.path.join(APP_DIR, "devices.json")  # cached scan results
 UI_FILE = os.path.join(APP_DIR, "ui.json")  # user-set column widths
 BACKUP_DIR = os.path.join(APP_DIR, "Backups")
@@ -90,7 +91,7 @@ class ScannerApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title("Сканер MikroTik")
-        self.root.geometry("1280x820")
+        self.root.geometry("1320x820")
 
         # file logging for observability (logs/scanner-*.log next to program)
         self.logger, self.log_path = setup_logging(APP_DIR)
@@ -198,7 +199,7 @@ class ScannerApp:
         form_canvas.pack(fill=X)
         form_scroll = ttk.Scrollbar(form_host, orient="horizontal", command=form_canvas.xview)
         form_canvas.configure(xscrollcommand=form_scroll.set)
-        form = ttk.Frame(form_canvas, padding=(6, 4))
+        form = ttk.Frame(form_canvas, padding=(3, 4))
         form_canvas.create_window((0, 0), window=form, anchor="nw")
 
         def resize_form(_event=None):
@@ -212,28 +213,61 @@ class ScannerApp:
         form.bind("<Configure>", resize_form)
         form_canvas.bind("<Configure>", resize_form)
 
+        def show_widget(widget):
+            """Scroll the field row so that a focused field is fully visible."""
+            total = form.winfo_reqwidth()
+            view = form_canvas.winfo_width()
+            if total <= view:
+                return
+            left = widget.winfo_x()
+            right = left + widget.winfo_width()
+            first = form_canvas.canvasx(0)
+            if left < first:
+                form_canvas.xview_moveto(max(0, left - 8) / total)
+            elif right > first + view:
+                form_canvas.xview_moveto(min(total - view, right + 8 - view) / total)
+
+        def wheel(event):
+            if form.winfo_reqwidth() <= form_canvas.winfo_width():
+                return None
+            step = -1 if (getattr(event, "delta", 0) > 0 or event.num == 4) else 1
+            form_canvas.xview_scroll(step * 3, "units")
+            return "break"
+
+        def watch(widget):
+            widget.bind("<FocusIn>", lambda e: show_widget(e.widget), add="+")
+
+        # the mouse wheel over the field row moves it sideways (when it does not fit)
+        for target in (form_canvas, form):
+            for seq in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>"):
+                target.bind(seq, wheel)
+
         def field(parent, label, var, width, show=None):
-            ttk.Label(parent, text=label).pack(side=LEFT, padx=(4, 2))
+            ttk.Label(parent, text=label).pack(side=LEFT, padx=(5, 1))
             e = ttk.Entry(parent, textvariable=var, width=width, show=show)
             e.pack(side=LEFT)
             self._attach_context_menu(e)
+            watch(e)
             return e
 
-        field(form, "Логин:", self.var_user, 10)
-        field(form, "Пароль:", self.var_pass, 10, show="*")
-        field(form, "Сеть:", self.var_network, 22)
+        # compact widths so the whole row fits a 1280 px window
+        field(form, "Логин:", self.var_user, 9)
+        field(form, "Пароль:", self.var_pass, 9, show="*")
+        field(form, "Сеть:", self.var_network, 15)
         # transport for scanning, refreshing, SEND and Backup
-        ttk.Label(form, text="Тип команд:").pack(side=LEFT, padx=(10, 2))
-        ttk.Combobox(
+        ttk.Label(form, text="Тип команд:").pack(side=LEFT, padx=(5, 1))
+        cmdtype_box = ttk.Combobox(
             form, textvariable=self.var_cmdtype, values=["API/SSL", "SSH"],
-            width=8, state="readonly",
-        ).pack(side=LEFT)
-        field(form, "API-SSL:", self.var_api_port, 6)
-        field(form, "SSH:", self.var_ssh_port, 6)
-        field(form, "Winbox:", self.var_winbox_port, 6)
-        field(form, "Потоки:", self.var_threads, 5)
-        field(form, "Таймаут, с:", self.var_timeout, 4)
-        field(form, "Повторы:", self.var_retries, 3)
+            width=7, state="readonly",
+        )
+        cmdtype_box.pack(side=LEFT)
+        watch(cmdtype_box)
+        field(form, "API-SSL:", self.var_api_port, 5)
+        field(form, "SSH:", self.var_ssh_port, 5)
+        field(form, "Winbox:", self.var_winbox_port, 5)
+        field(form, "Потоки:", self.var_threads, 3)
+        field(form, "Таймаут:", self.var_timeout, 3)
+        field(form, "Повторы:", self.var_retries, 2)
 
         # buttons row
         actions = ttk.Frame(self.root, padding=(6, 0))
@@ -1086,7 +1120,7 @@ class ScannerApp:
         def work():
             ip = dev.reach_ip
             try:
-                fresh = self._poll_host(ip, cfg)
+                fresh = self._poll_host(ip, cfg, dev.ip)
                 fresh = dedupe_devices([fresh])[0]  # keep bridge1 as the shown IP
                 fresh.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.log(f"{ip}: обновлено {fresh.identity or fresh.board_name} [{fresh.status}]")
@@ -1357,15 +1391,18 @@ class ScannerApp:
         unless a filter is on); the «Сеть» field is not used."""
         if self._busy():
             return
-        targets = []
+        targets, alternatives = [], {}
         for iid in self._visible_iids():
-            ip = self.devices[iid].reach_ip
+            dev = self.devices[iid]
+            ip = dev.reach_ip
             if ip and ip not in targets:
                 targets.append(ip)
+                if dev.ip and dev.ip != ip:
+                    alternatives[ip] = dev.ip   # bridge1 address, for SSH
         if not targets:
             messagebox.showinfo("Обновить", "В таблице нет устройств для обновления. Сначала выполните «Скан».")
             return
-        self._start_scan(targets, "Обновление")
+        self._start_scan(targets, "Обновление", alternatives)
 
     def _targets_or_warn(self):
         """Expand the «Сеть» field; None (after a message) if it's invalid."""
@@ -1377,16 +1414,30 @@ class ScannerApp:
                         "Примеры: 192.168.0.0/24, 10.20.76.112/28, 192.168.0.10-20, 192.168.0.5")
             return None
 
-    def _poll_host(self, ip: str, cfg: dict) -> Device:
+    def _poll_host(self, ip: str, cfg: dict, alt_ip: str = "") -> Device:
+        """Poll one device with the selected transport. Over SSH, `alt_ip` (the
+        bridge1 address of a device already in the table) is tried when SSH does
+        not answer on `ip` at all, like «Отправить» and «Бэкап» do."""
         if cfg["cmdtype"] == "SSH":
-            from ssh_client import scan_host_ssh
-            return scan_host_ssh(ip, cfg["user"], cfg["password"], port=cfg["ssh_port"],
-                                 timeout=cfg["timeout"], retries=cfg["retries"])
+            from ssh_client import SSHStageError, scan_host_ssh
+
+            def poll(host: str) -> Device:
+                return scan_host_ssh(host, cfg["user"], cfg["password"], port=cfg["ssh_port"],
+                                     timeout=cfg["timeout"], retries=cfg["retries"],
+                                     logger=self.logger)
+            try:
+                return poll(ip)
+            except SSHStageError as exc:
+                if not (exc.unreachable and alt_ip and alt_ip != ip):
+                    raise
+                self.log(f"{ip}: {exc}; пробую адрес bridge1 {alt_ip}")
+                return poll(alt_ip)
         return core.scan_host(ip, cfg["user"], cfg["password"], cfg["api_ssl_port"],
                               plain_port=8728, timeout=cfg["timeout"], retries=cfg["retries"],
                               logger=self.logger)
 
-    def _start_scan(self, targets: list[str], kind: str) -> None:
+    def _start_scan(self, targets: list[str], kind: str, alternatives: dict | None = None) -> None:
+        alternatives = alternatives or {}
         self._maybe_save_settings()
         cfg = self._read_config()
         found: list[Device] = []
@@ -1398,7 +1449,7 @@ class ScannerApp:
 
         def scan_one(ip: str) -> bool:
             try:
-                dev = self._poll_host(ip, cfg)
+                dev = self._poll_host(ip, cfg, alternatives.get(ip, ""))
                 dev.last_seen = datetime.now().strftime(TIME_FORMAT)
                 self.log(f"{ip}: найдено {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
@@ -1467,7 +1518,9 @@ class ScannerApp:
                 messagebox.showerror("Отправить", str(exc))
                 return
         self.notebook.select(len(self.command_editors))  # show output tab
-        self.log(f"Отправка ({cfg['cmdtype']}): устройств {len(devices)}, одновременно {self._ops_threads(cfg)}")
+        self.log(f"Отправка ({cfg['cmdtype']}, «Команда {self.active_command + 1}»): устройств {len(devices)}, "
+                 f"одновременно {self._ops_threads(cfg)}")
+        self._save_commands()
         self._start_job("Команды", devices, lambda dev: self._send_one(dev, command, cfg),
                         self._ops_threads(cfg), ok_label="успешно", bad_label="ошибок")
 
@@ -1784,11 +1837,12 @@ class ScannerApp:
             "cmdtype": self.var_cmdtype.get(),
             "timeout": self.var_timeout.get(),
             "retries": self.var_retries.get(),
-            "commands": [editor.get("1.0", "end-1c") for editor in self.command_editors],
-            "active_command": self.active_command,
             "save": True,
         })
-        data.pop("command", None)  # migrated to ten independent drafts
+        # the command drafts live in commands.json now (kept even without «Запомнить настройки»)
+        for key in ("command", "commands", "active_command"):
+            data.pop(key, None)
+        self._save_commands()
         # Password is stored only when Save is ticked; base64 is obfuscation,
         # not encryption — the file is local to the operator's machine.
         data["password"] = base64.b64encode(self.var_pass.get().encode()).decode()
@@ -1799,12 +1853,16 @@ class ScannerApp:
             self.log(f"Не удалось сохранить настройки: {exc}")
 
     def _load_settings(self) -> None:
-        if not os.path.exists(SETTINGS_FILE):
-            return
+        data = {}
         try:
             with open(SETTINGS_FILE, encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, json.JSONDecodeError):
+            pass
+        if not isinstance(data, dict):
+            data = {}
+        self._load_commands(data)
+        if not data:
             return
         self.var_user.set(data.get("user", ""))
         self.var_network.set(data.get("network", ""))
@@ -1821,6 +1879,33 @@ class ScannerApp:
                 self.var_pass.set(base64.b64decode(data["password"]).decode())
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---- the 10 command drafts: commands.json, saved always (no password in it)
+    def _save_commands(self) -> None:
+        self._command_tab_changed()
+        data = {"commands": [editor.get("1.0", "end-1c") for editor in self.command_editors],
+                "active_command": self.active_command}
+        try:
+            tmp = COMMANDS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, COMMANDS_FILE)
+        except OSError as exc:
+            self.log(f"Не удалось сохранить тексты команд: {exc}")
+
+    def _load_commands(self, legacy: dict | None = None) -> None:
+        """Drafts from commands.json; without it, from an older settings.json
+        (its ten "commands", or the single "command" of earlier versions)."""
+        data = None
+        try:
+            with open(COMMANDS_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            pass
+        if not isinstance(data, dict):
+            data = legacy or {}
+            if not isinstance(data.get("commands"), list) and not data.get("command"):
+                return   # nothing saved anywhere: keep the tabs as they are
         commands = data.get("commands")
         if not isinstance(commands, list):
             commands = [data.get("command", "")]
@@ -1829,7 +1914,8 @@ class ScannerApp:
             if i < len(commands) and isinstance(commands[i], str):
                 editor.insert("1.0", commands[i])
         active = data.get("active_command", 0)
-        self.active_command = active if isinstance(active, int) and 0 <= active < 10 else 0
+        self.active_command = (active if isinstance(active, int) and not isinstance(active, bool)
+                               and 0 <= active < len(self.command_editors) else 0)
         self.notebook.select(self.active_command)
 
     def _on_close(self) -> None:
@@ -1841,6 +1927,7 @@ class ScannerApp:
             except (tk.TclError, AttributeError):
                 pass
         self._maybe_save_settings()
+        self._save_commands()
         self._save_devices()  # persist statuses (backups/commands) too
         self._save_ui_state()
         self.root.destroy()

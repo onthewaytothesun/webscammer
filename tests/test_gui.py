@@ -20,6 +20,7 @@ def _open():
 
     work = tempfile.mkdtemp()
     for name, fname in (("APP_DIR", ""), ("DEVICES_FILE", "devices.json"), ("UI_FILE", "ui.json"),
+                        ("COMMANDS_FILE", "commands.json"),
                         ("SETTINGS_FILE", "settings.json"), ("BACKUP_DIR", "Backups")):
         setattr(M, name, os.path.join(work, fname) if fname else work)
     os.makedirs(M.BACKUP_DIR)
@@ -1006,6 +1007,7 @@ def test_gui_ten_command_tabs_send_selected_text_and_persist_all_drafts():
         for i, widget in enumerate(app.command_editors):
             assert widget.get("1.0", "end-1c") == f":put {i + 1}"
         assert app.txt_command.get("1.0", "end-1c") == ":put 7"
+        os.remove(M.COMMANDS_FILE)        # an older install: the single command lives in settings.json
         with open(M.SETTINGS_FILE, "w") as fh:
             json.dump({"command": "/system resource print"}, fh)
         app._load_settings()
@@ -1040,5 +1042,100 @@ def test_gui_ssh_scan_and_refresh_use_selected_transport():
                     break
             assert run.call_count == 3
             assert run.call_args.args[0] == "192.168.1.1"
+    finally:
+        app._on_close()
+
+
+def test_gui_ssh_update_falls_back_to_the_bridge1_address():
+    from core import Device
+    import ssh_client
+    M, tk, root, app = _open()
+    tried = []
+    real = ssh_client.scan_host_ssh
+
+    def fake(host, user, password, port=22, timeout=10, retries=2, logger=None):
+        tried.append(host)
+        if host == "10.20.30.209":                # the address the API scan reached: SSH closed there
+            raise ssh_client.SSHStageError("SSH-порт закрыт", unreachable=True)
+        if host == "10.20.30.210":                # a real login problem must NOT be retried elsewhere
+            raise ssh_client.SSHStageError("не удалось войти по SSH")
+        return Device(ip=host, connect_ip=host, identity="R1", key="SN1", status=f"OK (SSH:{port})",
+                      addresses=[{"address": "10.20.44.209/24", "interface": "bridge1"}])
+
+    ssh_client.scan_host_ssh = fake
+    try:
+        app._upsert_device(Device(ip="10.20.44.209", identity="R1", key="SN1", connect_ip="10.20.30.209"))
+        app._upsert_device(Device(ip="10.20.44.210", identity="R2", key="SN2", connect_ip="10.20.30.210"))
+        app.var_cmdtype.set("SSH")
+        app.on_update()
+        _wait_job(root, app)
+        assert tried.count("10.20.44.209") == 1 and "10.20.44.210" not in tried, tried
+        assert not app.devices["SN1"].failed and app.devices["SN1"].reach_ip == "10.20.44.209"
+        assert app.devices["SN2"].failed
+        assert "пробую адрес bridge1 10.20.44.209" in app.txt_output.get("1.0", "end")
+
+        tried.clear()                             # the ⟳ button of one row does the same
+        app.devices["SN1"].connect_ip = "10.20.30.209"
+        app.on_update_one("SN1")
+        for _ in range(50):
+            _pump(root, 1)
+            if "10.20.44.209" in tried:
+                break
+        assert tried == ["10.20.30.209", "10.20.44.209"], tried
+    finally:
+        ssh_client.scan_host_ssh = real
+        app._on_close()
+
+
+def test_gui_command_drafts_are_kept_without_remember_settings_and_log_names_the_tab():
+    from unittest.mock import patch
+    M, tk, root, app = _open()
+    try:
+        app.var_save.set(False)                   # the password must not be stored ...
+        for i, text in ((0, "/system identity print"), (4, ":put five")):
+            app.notebook.select(i)
+            _pump(root, 1)
+            app.txt_command.insert("1.0", text)
+        app.var_cmdtype.set("SSH")
+        app._upsert_device(_devices()[0])
+        app.toggle_all()
+        with patch("ssh_client.run_ssh_command", return_value="ok"):
+            app.on_send()
+            _wait_job(root, app)
+        assert "«Команда 5»" in app.txt_output.get("1.0", "end")
+    finally:
+        app._on_close()
+    assert not os.path.exists(M.SETTINGS_FILE)            # ... and it is not
+    saved = json.load(open(M.COMMANDS_FILE, encoding="utf-8"))
+    assert "password" not in saved and saved["commands"][4] == ":put five" and saved["active_command"] == 4
+    root2 = tk.Tk()
+    app2 = M.ScannerApp(root2)
+    try:
+        assert app2.command_editors[0].get("1.0", "end-1c") == "/system identity print"
+        assert app2.txt_command.get("1.0", "end-1c") == ":put five"
+    finally:
+        app2._on_close()
+
+
+def test_gui_the_field_row_fits_and_a_focused_field_is_scrolled_into_view():
+    M, tk, root, app = _open()
+    try:
+        root.geometry("1280x500")
+        _pump(root, 5)
+        form_canvas = root.winfo_children()[0].winfo_children()[0]
+        form = form_canvas.winfo_children()[0]
+        assert form.winfo_reqwidth() <= 1280, form.winfo_reqwidth()
+
+        root.geometry("700x500")                  # a narrow window: the row scrolls instead of hiding fields
+        _pump(root, 5)
+        entries = [w for w in form.winfo_children() if isinstance(w, tk.ttk.Entry)]
+        last = entries[-1]
+        last.focus_force()
+        _pump(root, 5)
+        left = form_canvas.canvasx(0)
+        assert left <= last.winfo_x() and last.winfo_x() + last.winfo_width() <= left + form_canvas.winfo_width()
+        entries[0].focus_force()
+        _pump(root, 5)
+        assert form_canvas.canvasx(0) <= entries[0].winfo_x()
     finally:
         app._on_close()

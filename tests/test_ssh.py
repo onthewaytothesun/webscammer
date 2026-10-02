@@ -248,3 +248,43 @@ def test_ssh_inventory_supports_chr_and_rejects_empty_or_non_routeros_output():
                 pass
             else:
                 assert False, "must not mark failed inventory as OK"
+
+
+def test_failed_ssh_inventory_says_what_the_device_answered():
+    from unittest.mock import patch
+    cases = {
+        "expected end of command (line 1 column 4)": "expected end of command",
+        "bash: -c: syntax error near unexpected token `('": "syntax error",
+        "": "ничего не ответило",
+    }
+    for reply, expected in cases.items():
+        with patch.object(ssh_client, "run_ssh_command", return_value=reply):
+            try:
+                ssh_client.scan_host_ssh("10.0.0.1", "admin", "secret")
+                raise AssertionError("must fail")
+            except ssh_client.SSHStageError as exc:
+                assert expected in str(exc), str(exc)
+                assert not exc.unreachable
+    long_reply = "x" * 500 + "\r\nsecond line"
+    with patch.object(ssh_client, "run_ssh_command", return_value=long_reply):
+        try:
+            ssh_client.scan_host_ssh("10.0.0.1", "admin", "secret")
+        except ssh_client.SSHStageError as exc:
+            assert len(str(exc)) < 400 and "…" in str(exc), len(str(exc))
+
+
+def test_ssh_inventory_reply_goes_to_the_log_file():
+    import logging
+    from unittest.mock import patch
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger = logging.getLogger("test-ssh-inventory")
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(Keep())
+    with patch.object(ssh_client, "run_ssh_command", return_value="__MTSCAN__identity=R1\r\n"):
+        ssh_client.scan_host_ssh("10.0.0.1", "admin", "secret", logger=logger)
+    assert any("10.0.0.1" in r and "__MTSCAN__identity=R1" in r for r in records), records

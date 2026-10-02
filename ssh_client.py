@@ -334,13 +334,21 @@ _INVENTORY_SCRIPT = "; ".join(
     '[/ip address get $id address] . "|" . [/ip address get $id interface]) } } on-error={}'
 
 
+def _snippet(text: str, limit: int = 160) -> str:
+    """The router's own reply, shortened to one line, for an error message."""
+    line = " | ".join(part.strip() for part in text.splitlines() if part.strip())
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
 def scan_host_ssh(host: str, username: str, password: str, port: int = 22,
-                  timeout: float = 10.0, retries: int = 2):
+                  timeout: float = 10.0, retries: int = 2, logger=None):
     """Read RouterOS inventory in one SSH session without changing the router."""
     from core import Device
 
     output = run_ssh_command(host, username, password, _INVENTORY_SCRIPT,
                              port=port, timeout=timeout, retries=retries)
+    if logger is not None:
+        logger.debug("%s: SSH inventory reply: %r", host, output[:2000])
     fields, addresses = {}, []
     for line in output.splitlines():
         if not line.startswith("__MTSCAN__"):
@@ -363,5 +371,11 @@ def scan_host_ssh(host: str, username: str, password: str, port: int = 22,
         addresses=addresses, status=f"OK (SSH:{port})",
     )
     if not (dev.identity or dev.board_name or dev.routeros):
-        raise SSHStageError("SSH: роутер не вернул данных RouterOS (проверьте права пользователя)")
+        # Say what actually came back: a permissions problem, a script error on
+        # this RouterOS version and a non-RouterOS host all look different here.
+        reply = _snippet(output)
+        raise SSHStageError(
+            "SSH: не удалось прочитать данные RouterOS — "
+            + (f"ответ устройства: «{reply}»" if reply else "устройство ничего не ответило")
+            + " (нужны права read у пользователя; если это не RouterOS — устройство пропускается)")
     return dev
