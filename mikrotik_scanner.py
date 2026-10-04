@@ -150,6 +150,10 @@ class ScannerApp:
         self.var_weak_radio = BooleanVar(value=False)
         self.var_changed_only = BooleanVar(value=False)
         self.var_favorites = BooleanVar(value=False)
+        self.var_confirmed = BooleanVar(value=False)
+        self.var_signal_show = BooleanVar(value=False)
+        self.var_signal_limit = StringVar()
+        self._signal_limit = None   # the parsed «не лучше» value, dBm
         self._baselines: dict = {}   # iid -> the device as it was before the running scan / update
 
         self._build_ui()
@@ -306,7 +310,8 @@ class ScannerApp:
         ttk.Button(actions, text="Обновить", command=self.on_update).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Удалить", command=self.on_delete).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Бэкап", command=self.on_backup).pack(side=LEFT, padx=2)
-        ttk.Button(actions, text="★ Избранное", command=self.on_favorite).pack(side=LEFT, padx=(10, 2))
+        ttk.Button(actions, text="Подтвердить", command=self.on_confirm).pack(side=LEFT, padx=(10, 2))
+        ttk.Button(actions, text="★ Избранное", command=self.on_favorite).pack(side=LEFT, padx=2)
         ttk.Label(actions, text="Команда:").pack(side=RIGHT, padx=(2, 4))
         ttk.Button(actions, text="Отправить", command=self.on_send).pack(side=RIGHT, padx=2)
 
@@ -374,12 +379,29 @@ class ScannerApp:
         ttk.Checkbutton(filters, text="Только без бэкапов", variable=self.var_no_backup,
                         command=self._on_filter_change).pack(side=LEFT, padx=(12, 0))
         for text, var in (("Только с изменениями", self.var_changed_only),
-                          ("Проблемы с портом", self.var_port_issue),
-                          ("Слабое радио", self.var_weak_radio),
                           ("Избранное", self.var_favorites)):
             ttk.Checkbutton(filters, text=text, variable=var,
                             command=self._on_filter_change).pack(side=LEFT, padx=(12, 0))
         self._update_models_button()
+
+        # second filter row: device health
+        health_row = ttk.Frame(self.root)
+        health_row.pack(fill=X, padx=6, pady=(2, 0))
+        for i, (text, var) in enumerate((("Проблемы с портом", self.var_port_issue),
+                                         ("Слабое радио", self.var_weak_radio),
+                                         ("Подтверждённые", self.var_confirmed))):
+            ttk.Checkbutton(health_row, text=text, variable=var,
+                            command=self._on_filter_change).pack(side=LEFT, padx=(4 if i == 0 else 12, 0))
+        ttk.Checkbutton(health_row, text="Сигнал", variable=self.var_signal_show,
+                        command=self._on_filter_change).pack(side=LEFT, padx=(24, 0))
+        ttk.Label(health_row, text="не лучше").pack(side=LEFT, padx=(8, 4))
+        signal_entry = ttk.Entry(health_row, textvariable=self.var_signal_limit, width=6)
+        signal_entry.pack(side=LEFT)
+        self._attach_context_menu(signal_entry)
+        signal_entry.bind("<Escape>", lambda e: self.var_signal_limit.set(""))
+        ttk.Label(health_row, text="дБм (например −65: показать сигналы −65 и хуже)",
+                  foreground="#666").pack(side=LEFT, padx=(4, 0))
+        self.var_signal_limit.trace_add("write", lambda *_: self._on_search_changed())
 
         # table
         table_frame = ttk.Frame(self.root)
@@ -654,9 +676,10 @@ class ScannerApp:
     def _row_tags(self, dev: Device) -> tuple:
         """One colour tag per row: red for a failed device, purple for unsaved changes,
         blue for port problems, light blue for weak radio, else by age of the last backup."""
-        if dev.failed:
+        if health.open_problem(dev, "error"):
             return ("error",)
-        for tag, flag in (("changed", dev.changes), ("port", dev.port_problem), ("radio", dev.radio_problem)):
+        for tag, flag in (("changed", dev.changes), ("port", health.open_problem(dev, "port")),
+                          ("radio", health.open_problem(dev, "radio"))):
             if flag:
                 return (tag,)
         tag = core.backup_age_tag(dev.last_backup)
@@ -689,16 +712,22 @@ class ScannerApp:
     def _matches_filter(self, dev: Device) -> bool:
         if self._models_sel and self._model_key(dev) not in self._models_sel:
             return False
-        if self.var_errors_only.get() and not dev.failed:
+        if self.var_errors_only.get() and not health.open_problem(dev, "error"):
             return False
         if self.var_no_backup.get() and dev.last_backup:
             return False
         if self.var_changed_only.get() and not dev.changes:
             return False
-        if self.var_port_issue.get() and not dev.port_problem:
+        if self.var_port_issue.get() and not health.open_problem(dev, "port"):
             return False
-        if self.var_weak_radio.get() and not dev.radio_problem:
+        if self.var_weak_radio.get() and not health.open_problem(dev, "radio"):
             return False
+        if self.var_confirmed.get() and not dev.confirmed:
+            return False
+        if self._signal_limit is not None:
+            worst = health.worst_signal(dev.radio)
+            if worst is None or worst > self._signal_limit:
+                return False
         if self.var_favorites.get() and not dev.favorite:
             return False
         months = self._age_months()
@@ -756,11 +785,22 @@ class ScannerApp:
         self._counts_dirty = True
 
     def _on_filter_change(self) -> None:
-        self._show_signal_column(self.var_weak_radio.get())
+        self._show_signal_column(self.var_weak_radio.get() or self.var_signal_show.get()
+                                 or self._signal_limit is not None)
         self._relayout()
 
+    @staticmethod
+    def _parse_signal_limit(text: str):
+        """'-65', '65', '−65' -> -65 (signals are negative); '' or junk -> None."""
+        text = text.strip().replace("−", "-").replace(",", ".")
+        try:
+            value = int(float(text))
+        except ValueError:
+            return None
+        return -abs(value)
+
     def _show_signal_column(self, show: bool) -> None:
-        """The «Сигнал» column is there only while «Слабое радио» is ticked."""
+        """The «Сигнал» column is there only with «Сигнал», «Слабое радио» or a «не лучше» value."""
         self.tree.configure(displaycolumns=[c for c in TREE_COLUMNS if show or c != "signal"])
 
     def _on_search_changed(self) -> None:
@@ -770,18 +810,28 @@ class ScannerApp:
         self._search_job = self.root.after(150, self._apply_search)
 
     def _apply_search(self) -> None:
+        if self._search_job is not None:   # called directly while a delayed run is pending
+            try:
+                self.root.after_cancel(self._search_job)
+            except tk.TclError:
+                pass
         self._search_job = None
         words = self.var_find.get().lower().split()
-        if words != self._search_words:
+        limit = self._parse_signal_limit(self.var_signal_limit.get())
+        if words != self._search_words or limit != self._signal_limit:
             self._search_words = words
-            self._relayout()
+            self._signal_limit = limit
+            self._on_filter_change()
 
     def _reset_filters(self) -> None:
         self._models_sel.clear()
         self.var_errors_only.set(False)
         self.var_no_backup.set(False)
-        for var in (self.var_changed_only, self.var_port_issue, self.var_weak_radio, self.var_favorites):
+        for var in (self.var_changed_only, self.var_port_issue, self.var_weak_radio, self.var_favorites,
+                    self.var_confirmed, self.var_signal_show):
             var.set(False)
+        self.var_signal_limit.set("")
+        self._signal_limit = None
         self._show_signal_column(False)
         self.var_age.set(AGE_CHOICES[0][0])
         self.var_find.set("")
@@ -891,7 +941,7 @@ class ScannerApp:
         total = len(self.devices)
         ticked_shown = sum(1 for i in self.checked if i in self.devices and i not in self._hidden)
         ticked_hidden = sum(1 for i in self.checked if i in self.devices and i in self._hidden)
-        failed = sum(1 for d in self.devices.values() if d.failed)
+        failed = sum(1 for d in self.devices.values() if health.open_problem(d, "error"))
         text = f"Устройств: {total}"
         if self._hidden:
             text += f" (показано {total - len(self._hidden)})"
@@ -909,7 +959,7 @@ class ScannerApp:
         stale = [i for i, d in self.devices.items() if d.ip == dev.ip and i != iid]
         # a rescan builds a fresh Device that knows nothing about backups or notes
         previous = [p for p in [self.devices.get(iid)] + [self.devices[i] for i in stale] if p]
-        for attr in ("last_backup", "note", "favorite"):
+        for attr in ("last_backup", "note", "favorite", "confirmed"):
             if not getattr(dev, attr):
                 setattr(dev, attr, next((getattr(p, attr) for p in previous if getattr(p, attr)),
                                         getattr(dev, attr)))
@@ -945,8 +995,11 @@ class ScannerApp:
             before = self.devices.get(iid) or next(
                 (d for d in self.devices.values() if dev.ip in (d.ip, d.reach_ip)), None)
             self._baselines[iid] = copy.deepcopy(before)
-        health.analyse(dev, self._baselines[iid])
-        if dev.changes or dev.port_problem or dev.radio_problem:
+        base = self._baselines[iid]
+        if base is not None:
+            dev.confirmed = list(base.confirmed)   # accepted problems stay accepted
+        health.analyse(dev, base)
+        if health.status_parts(dev):
             self._write_log(f"{dev.ip} ({dev.identity}): {dev.status}")   # the full text; the cell may be cut
         self._upsert_device(dev)
 
@@ -1138,6 +1191,10 @@ class ScannerApp:
         menu.add_command(label="Копировать строку", command=lambda: self._copy_text(row_text))
         menu.add_separator()
         menu.add_command(label="Изменить заметку…", command=lambda: self._edit_note(iid))
+        confirmed = bool(self.devices[iid].confirmed) and not self._unconfirmed(self.devices[iid])
+        menu.add_command(label="Снять подтверждение" if confirmed else "Подтвердить",
+                         state="normal" if confirmed or self._unconfirmed(self.devices[iid]) else "disabled",
+                         command=lambda: self._set_confirmed([iid], not confirmed))
         favorite = self.devices[iid].favorite
         menu.add_command(label="Убрать из избранного" if favorite else "Добавить в избранное",
                          command=lambda: self._set_favorite([iid], not favorite))
@@ -1237,6 +1294,55 @@ class ScannerApp:
             self.ui_queue.put(("save_devices", None))
 
         threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _unconfirmed(dev: Device) -> list:
+        return [k for k in health.problem_kinds(dev) if k not in dev.confirmed]
+
+    def on_confirm(self) -> None:
+        """«Подтвердить»: accept the current problems of the ticked rows that are shown
+        (connection error, port, weak radio — not changes): the row is no longer
+        coloured and leaves those filters. If nothing is left to accept, it takes
+        the confirmation back."""
+        iids = self.selected_iids()
+        if not iids:
+            messagebox.showinfo("Подтвердить", "Отметьте галочками устройства, проблемы которых "
+                                               "нужно подтвердить (или снять подтверждение).")
+            return
+        devices = [self.devices[i] for i in iids]
+        if any(self._unconfirmed(d) for d in devices):
+            self._set_confirmed(iids, True)
+        elif any(d.confirmed for d in devices):
+            self._set_confirmed(iids, False)
+        else:
+            messagebox.showinfo("Подтвердить", "У отмеченных устройств нет ошибок, проблем с портом "
+                                               "или слабого радио — подтверждать нечего.")
+
+    def _set_confirmed(self, iids: list, state: bool) -> None:
+        count = 0
+        for iid in iids:
+            dev = self.devices.get(iid)
+            if dev is None:
+                continue
+            if state:
+                fresh = self._unconfirmed(dev)
+                if not fresh:
+                    continue
+                dev.confirmed = sorted(set(dev.confirmed) | set(fresh))
+                dev.status = " | ".join(health.status_parts(dev)) or "Подтверждено"
+            else:
+                if not dev.confirmed:
+                    continue
+                dev.confirmed = []
+                dev.status = " | ".join(health.status_parts(dev)) or (
+                    "Ошибка (подробности в логе; «Обновить» — проверить снова)" if dev.failed else "OK")
+            count += 1
+            if self.tree.exists(iid):
+                self.tree.item(iid, values=self._row_values(dev), tags=self._row_tags(dev))
+            self._apply_visibility(iid)
+        self._counts_dirty = True
+        self._save_devices()
+        self.log(f"{'Подтверждено' if state else 'Снято подтверждение'}: {count}")
 
     def on_favorite(self) -> None:
         """«★ Избранное»: add the ticked rows that are shown to the favourites,

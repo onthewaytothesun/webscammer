@@ -59,6 +59,7 @@ class Device:
     radio_problem: str = ""
     changes: str = ""        # changed since an earlier update and not yet saved by a backup
     favorite: bool = False
+    confirmed: List[str] = field(default_factory=list)   # problem kinds accepted with «Подтвердить»
 
     @property
     def reach_ip(self) -> str:
@@ -302,7 +303,9 @@ def _collect_health(api: RouterOSApi, dev: Device) -> None:
             ports[name] = {"name": name, "running": row.get("running") == "true", "rate": "",
                            "full_duplex": "", "link_downs": None,
                            "errors": health.error_counters(row)}
-    for row in _talk_or_empty(api, ["/interface/print", "=.proplist=name,link-downs,rx-error,tx-error,rx-drop,tx-drop"]):
+    link_downs: Dict[str, Optional[int]] = {}
+    for row in _talk_or_empty(api, ["/interface/print", "=.proplist=name,link-downs,rx-error,tx-error"]):
+        link_downs[row.get("name", "")] = health.to_int(row.get("link-downs"))
         port = ports.get(row.get("name", ""))
         if port is not None:
             port["link_downs"] = health.to_int(row.get("link-downs"))
@@ -317,7 +320,8 @@ def _collect_health(api: RouterOSApi, dev: Device) -> None:
     dev.ports = list(ports.values())
     dev.wireless = [
         {"name": r.get("name", ""), "ssid": r.get("ssid", ""), "radio_name": r.get("radio-name", ""),
-         "disabled": r.get("disabled") == "true", "running": r.get("running") == "true"}
+         "disabled": r.get("disabled") == "true", "running": r.get("running") == "true",
+         "link_downs": link_downs.get(r.get("name", ""))}
         for r in _talk_or_empty(api, ["/interface/wireless/print"])
     ]
     dev.radio = [

@@ -353,14 +353,14 @@ def _health_script() -> str:
     parts = [
         ':foreach i in=[/interface ethernet find] do={:put ("__MTSCAN__eth=" . '
         '[/interface ethernet get $i name] . "|" . [/interface ethernet get $i running])}',
-        ':foreach i in=[/interface find where type="ether"] do={:do {:put ("__MTSCAN__ld=" . '
+        ':foreach i in=[/interface find where (type="ether" or type="wlan")] do={:do {:put ("__MTSCAN__ld=" . '
         '[/interface get $i name] . "|" . [/interface get $i link-downs])} on-error={}}',
         ':foreach i in=[/interface ethernet find where running] do={:do {'
         ':local m [/interface ethernet monitor $i once as-value]; :put ("__MTSCAN__mon=" . '
         '[/interface ethernet get $i name] . "|" . ($m->"rate") . "|" . ($m->"full-duplex"))} on-error={}}',
         ':foreach s in=[/interface ethernet print stats as-value] do={:foreach c in={' + counters + '} do={'
         ':local v ($s->$c); :if ([:len $v] > 0) do={:put ("__MTSCAN__err=" . ($s->"name") . "|" . $c . "|" . $v)}}}',
-        ':foreach i in=[/interface find where type="ether"] do={:foreach c in={"rx-error";"tx-error";"rx-drop";"tx-drop"} do={'
+        ':foreach i in=[/interface find where type="ether"] do={:foreach c in={"rx-error";"tx-error"} do={'
         ':do {:put ("__MTSCAN__err=" . [/interface get $i name] . "|" . $c . "|" . [/interface get $i $c])} on-error={}}}',
         ':foreach i in=[/interface wireless find] do={:put ("__MTSCAN__wlan=" . [/interface wireless get $i name] . "|" . '
         '[/interface wireless get $i disabled] . "|" . [/interface wireless get $i running] . "|" . '
@@ -378,6 +378,7 @@ def parse_health(lines: List[str], dev) -> None:
     """Fill dev.ports / wireless / radio from the __MTSCAN__ lines of _health_script."""
     import health
     ports: Dict[str, Dict] = {}
+    link_downs: Dict[str, Optional[int]] = {}
     done = False
 
     def port(name: str) -> Dict:
@@ -392,8 +393,8 @@ def parse_health(lines: List[str], dev) -> None:
         fields = value.split("|")
         if key == "eth" and len(fields) >= 2:
             port(fields[0])["running"] = fields[1].strip() == "true"
-        elif key == "ld" and len(fields) >= 2 and fields[0] in ports:
-            ports[fields[0]]["link_downs"] = health.to_int(fields[1])
+        elif key == "ld" and len(fields) >= 2:
+            link_downs[fields[0]] = health.to_int(fields[1])
         elif key == "mon" and len(fields) >= 3 and fields[0] in ports:
             ports[fields[0]]["rate"], ports[fields[0]]["full_duplex"] = fields[1].strip(), fields[2].strip()
         elif key == "err" and len(fields) >= 3 and fields[0] in ports:
@@ -409,6 +410,11 @@ def parse_health(lines: List[str], dev) -> None:
                               "rx": health.parse_signal(fields[2]), "tx": health.parse_signal(fields[3])})
         elif key == "health":
             done = True
+    for name, downs in link_downs.items():
+        if name in ports:
+            ports[name]["link_downs"] = downs
+    for wlan in dev.wireless:
+        wlan["link_downs"] = link_downs.get(wlan["name"])
     dev.ports = list(ports.values())
     dev.extended = done
 

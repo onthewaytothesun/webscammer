@@ -161,11 +161,11 @@ def test_gui_right_click_copies_cell_or_row():
         assert len(row) == len(M.DATA_COLUMNS) and row[:2] == ["10.20.44.209", "R1"]
         assert row[-1] == ""                               # the note is the last data column
         labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1) if menu.type(i) == "command"]
-        assert labels[-2:] == ["Изменить заметку…", "Добавить в избранное"], labels
+        assert labels[-3:] == ["Изменить заметку…", "Подтвердить", "Добавить в избранное"], labels
         icons_menu = right_click("SN1", "#0")              # icons column: no cell to copy, but the row and the note
         assert [icons_menu.entrycget(i, "label") for i in range(icons_menu.index("end") + 1)
                 if icons_menu.type(i) == "command"] == ["Копировать строку", "Изменить заметку…",
-                                                        "Добавить в избранное"]
+                                                        "Подтвердить", "Добавить в избранное"]
     finally:
         tk.Menu.tk_popup = original
         app._on_close()
@@ -1224,5 +1224,61 @@ def test_gui_delete_moves_the_devices_backups_to_old():
             M.messagebox.askyesno = original
         assert not os.path.exists(path)
         assert os.listdir(os.path.join(M.BACKUP_DIR, "Old")) == ["10.0.0.1_R1_2026-01-01.rsc"]
+    finally:
+        app._on_close()
+
+
+def test_gui_confirm_hides_problems_but_not_changes_and_the_signal_filter():
+    M, tk, root, app = _open()
+    from core import Device
+    try:
+        def full(**kw):
+            base = dict(ip="10.0.0.1", identity="R1", key="S1", serial="S1", extended=True,
+                        radio=[{"interface": "wlan1", "mac": "AA", "rx": -80, "tx": -70}])
+            base.update(kw)
+            return Device(**base)
+        app._upsert_device(full())
+        app._upsert_device(full(ip="10.0.0.2", key="S2", serial="S2", identity="R2",
+                                radio=[{"interface": "wlan1", "mac": "BB", "rx": -60, "tx": -64}]))
+        app._baselines = {}
+        app._accept_polled(full(identity="R1-new"))           # weak radio + a change
+        assert app.tree.item("S1", "tags") == ("changed",)
+        app.checked.update({"S1", "S2"})
+        app.on_confirm()
+        dev = app.devices["S1"]
+        assert dev.confirmed == ["radio"] and app.devices["S2"].confirmed == []
+        assert dev.status.startswith("Изменено:") and "Радио" not in dev.status
+        app.var_weak_radio.set(True); app._on_filter_change()
+        assert app._visible_iids() == []
+        app.var_weak_radio.set(False); app.var_confirmed.set(True); app._on_filter_change()
+        assert app._visible_iids() == ["S1"]
+        app._reset_filters(); app._relayout()
+
+        app._baselines = {}                                    # the next update keeps it accepted
+        app._accept_polled(full(identity="R1-new"))
+        assert app.devices["S1"].confirmed == ["radio"] and "Радио" not in app.devices["S1"].status
+
+        app._set_status("S2", "Ошибка: timeout", True)
+        assert app.tree.item("S2", "tags") == ("error",)
+        app.checked = {"S2"}
+        app.on_confirm()
+        assert not app.tree.item("S2", "tags") and app.devices["S2"].status == "Подтверждено"
+        app.var_errors_only.set(True); app._on_filter_change()
+        assert app._visible_iids() == []
+        app._reset_filters(); app._relayout()
+        app.on_confirm()                                       # nothing left to accept: take it back
+        assert app.devices["S2"].confirmed == [] and app.tree.item("S2", "tags") == ("error",)
+
+        # «Сигнал» shows the column; «не лучше −65» keeps devices with a signal of −65 or worse
+        app.var_signal_show.set(True); app._on_filter_change()
+        assert "signal" in app.tree.cget("displaycolumns")
+        app.var_signal_show.set(False)
+        app.var_signal_limit.set("65"); app._apply_search()
+        assert app._signal_limit == -65 and app._visible_iids() == ["S1"]
+        assert "signal" in app.tree.cget("displaycolumns")
+        app.var_signal_limit.set("-60"); app._apply_search()
+        assert sorted(app._visible_iids()) == ["S1", "S2"]
+        app.var_signal_limit.set(""); app._apply_search()
+        assert "signal" not in app.tree.cget("displaycolumns")
     finally:
         app._on_close()

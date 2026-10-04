@@ -34,15 +34,16 @@ def test_port_issues_errors_flaps_and_ports_without_link():
     issues = health.port_issues([_port(errors={"rx-fcs-error": 12, "tx-collision": 1})])
     assert issues == ["ether1 ошибки rx-fcs-error=12"], issues      # 1 is not above the limit
     old = [_port(downs=4)]
-    assert health.port_issues([_port(downs=6)], old) == []
-    flapping = health.port_issues([_port(downs=7)], old)
-    assert flapping == ["ether1 линк пропадал 3 раз с прошлого обновления"], flapping
+    assert health.port_issues([_port(downs=13)], old) == []
+    flapping = health.port_issues([_port(downs=14)], old)
+    assert flapping == ["ether1 линк пропадал 10 раз с прошлого обновления"], flapping
 
 
 def test_error_counters_skip_broadcast_multicast_and_traffic():
     found = health.error_counters({"rx-fcs-error": "5", "rx-broadcast": "900", "rx-multicast": "77",
-                                   "rx-bytes": "123456", "tx-drop": "1 204", "rx-align-error": "0"})
-    assert found == {"rx-fcs-error": 5, "tx-drop": 1204}, found
+                                   "rx-bytes": "123456", "tx-drop": "1 204", "rx-align-error": "0",
+                                   "rx-pause": "40", "tx-pause": "9", "tx-collision": "1 024"})
+    assert found == {"rx-fcs-error": 5, "tx-collision": 1024}, found   # drop / pause are not errors
 
 
 def test_radio_weak_signal_and_a_drop_since_the_previous_update():
@@ -108,8 +109,8 @@ def test_api_reads_ports_wireless_and_registration_table():
         "/interface/ethernet/print =stats=": [
             {"name": "ether1", "running": "true", "rx-fcs-error": "9", "rx-broadcast": "50"},
             {"name": "ether2", "running": "false"}],
-        "/interface/print =.proplist=name,link-downs,rx-error,tx-error,rx-drop,tx-drop": [
-            {"name": "ether1", "link-downs": "2", "rx-error": "3"}],
+        "/interface/print =.proplist=name,link-downs,rx-error,tx-error": [
+            {"name": "ether1", "link-downs": "2", "rx-error": "3"}, {"name": "wlan1", "link-downs": "7"}],
         "/interface/ethernet/monitor =numbers=ether1 =once=": [{"rate": "100Mbps", "full-duplex": "false"}],
         "/interface/wireless/print": [{"name": "wlan1", "ssid": "net", "radio-name": "r1",
                                        "disabled": "false", "running": "true"}],
@@ -123,7 +124,7 @@ def test_api_reads_ports_wireless_and_registration_table():
     assert dev.ports[0] == {"name": "ether1", "running": True, "rate": "100Mbps", "full_duplex": "false",
                             "link_downs": 2, "errors": {"rx-fcs-error": 9, "rx-error": 3}}, dev.ports[0]
     assert dev.ports[1]["running"] is False and dev.ports[1]["rate"] == ""
-    assert dev.wireless[0]["ssid"] == "net" and dev.radio == [{"interface": "wlan1", "mac": "AA", "rx": -78, "tx": -70}]
+    assert dev.wireless[0]["ssid"] == "net" and dev.wireless[0]["link_downs"] == 7 and dev.radio == [{"interface": "wlan1", "mac": "AA", "rx": -78, "tx": -70}]
 
 
 def test_api_without_wireless_package_is_fine():
@@ -140,6 +141,7 @@ def test_ssh_health_script_is_isolated_and_its_reply_parsed():
     reply = """__MTSCAN__eth=ether1|true
 __MTSCAN__eth=ether2|false
 __MTSCAN__ld=ether1|5
+__MTSCAN__ld=wlan1|30
 __MTSCAN__mon=ether1|10Mbps|true
 __MTSCAN__err=ether1|rx-fcs-error|4
 __MTSCAN__err=ether1|rx-error|0
@@ -152,7 +154,7 @@ __MTSCAN__health=1"""
     assert dev.ports[0] == {"name": "ether1", "running": True, "rate": "10Mbps", "full_duplex": "true",
                             "link_downs": 5, "errors": {"rx-fcs-error": 4}}, dev.ports[0]
     assert dev.wireless == [{"name": "wlan1", "disabled": False, "running": True,
-                             "radio_name": "tower-1", "ssid": "My|Net"}]
+                             "radio_name": "tower-1", "ssid": "My|Net", "link_downs": 30}]
     assert dev.radio == [{"interface": "wlan1", "mac": "AA:BB", "rx": -80, "tx": None}]
 
 
@@ -175,3 +177,23 @@ def test_old_backups_are_moved_to_old_folder():
     assert sorted(os.listdir(work)) == ["10.0.0.12_R2_2026-01-01.rsc", "Old"]
     assert core.latest_backup_file(work, "10.0.0.1") is None
     assert core.archive_backups(work, "10.0.0.9") == []
+
+
+def test_wlan_flapping_more_than_10_times_is_weak_radio():
+    before = _full(wireless=[{"name": "wlan1", "ssid": "net", "radio_name": "r1", "link_downs": 5}])
+    same = _full(wireless=[{"name": "wlan1", "ssid": "net", "radio_name": "r1", "link_downs": 15}])
+    health.analyse(same, before)
+    assert same.radio_problem == ""                       # 10 is not more than 10
+    flapping = _full(wireless=[{"name": "wlan1", "ssid": "net", "radio_name": "r1", "link_downs": 16}])
+    health.analyse(flapping, before)
+    assert flapping.radio_problem == "wlan1: линк пропадал 11 раз с прошлого обновления"
+    assert flapping.status == "Радио: " + flapping.radio_problem
+
+
+def test_confirmed_problems_leave_the_status_but_changes_stay():
+    dev = _full(port_problem="ether1 10Mbps full-duplex", radio_problem="wlan1: слабый сигнал rx -80",
+                changes="имя: A → B", confirmed=["radio"])
+    assert health.problem_kinds(dev) == ["port", "radio"]
+    assert health.open_problem(dev, "port") and not health.open_problem(dev, "radio")
+    assert health.status_parts(dev) == ["Изменено: имя: A → B", "Порт: ether1 10Mbps full-duplex"]
+    assert health.worst_signal([{"rx": -60, "tx": -71}, {"rx": -65, "tx": None}]) == -71

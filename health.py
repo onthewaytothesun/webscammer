@@ -14,19 +14,20 @@ from typing import Dict, List, Optional
 
 WEAK_SIGNAL = -75        # dBm: a signal below this (rx or tx) is weak
 SIGNAL_DROP = 10         # dB worse than at the previous update = degraded
-FLAP_LINK_DOWNS = 3      # link lost this many times since the previous update = flapping
+FLAP_LINK_DOWNS = 10     # an ethernet link lost this many times since the previous update = flapping
+WLAN_FLAPS = 10          # a wlan link lost MORE than this many times since the previous update = flapping
 ERROR_LIMIT = 1          # an error counter above this is a problem
 
 _ERROR_COUNTER = re.compile(
-    r"error|fcs|align|fragment|overflow|too-short|too-long|jabber|drop|collision|"
+    r"error|fcs|align|fragment|overflow|too-short|too-long|jabber|collision|"
     r"underrun|carrier|deferred")
-_NOT_ERROR = re.compile(r"broadcast|multicast")
+_NOT_ERROR = re.compile(r"broadcast|multicast|drop|pause")   # drops and pause frames are not errors
 
 # error counters asked for over SSH (the names RouterOS uses in «print stats»)
 SSH_ERROR_COUNTERS = (
     "rx-fcs-error", "rx-align-error", "rx-fragment", "rx-overflow", "rx-too-short",
     "rx-too-long", "rx-jabber", "rx-error-events", "rx-code-error", "rx-carrier-error",
-    "rx-length-error", "rx-drop", "tx-drop", "tx-collision", "tx-excessive-collision",
+    "rx-length-error", "tx-collision", "tx-excessive-collision",
     "tx-multiple-collision", "tx-single-collision", "tx-late-collision", "tx-deferred",
     "tx-excessive-deferred", "tx-underrun", "tx-fcs-error", "tx-too-short", "tx-too-long",
 )
@@ -147,6 +148,23 @@ def radio_issues(radio: List[Dict], old_radio: Optional[List[Dict]] = None) -> L
     return issues
 
 
+def wlan_flap_issues(wireless: List[Dict], old_wireless: Optional[List[Dict]] = None) -> List[str]:
+    """A wlan interface whose link went down more than WLAN_FLAPS times since the previous update."""
+    old = {w.get("name"): w for w in old_wireless or []}
+    issues = []
+    for wlan in wireless:
+        now = to_int(wlan.get("link_downs"))
+        then = to_int((old.get(wlan.get("name")) or {}).get("link_downs"))
+        if now is not None and then is not None and now - then > WLAN_FLAPS:
+            issues.append(f"{wlan.get('name')}: линк пропадал {now - then} раз с прошлого обновления")
+    return issues
+
+
+def worst_signal(radio: List[Dict]) -> Optional[int]:
+    values = [e[side] for e in radio for side in ("rx", "tx") if e.get(side) is not None]
+    return min(values) if values else None
+
+
 def signal_text(radio: List[Dict]) -> str:
     """For the «Сигнал» column: 'wlan1 rx -68 / tx -70'."""
     parts = []
@@ -206,14 +224,37 @@ def analyse(new, base) -> None:
         return
     old_ok = base is not None and base.extended
     new.port_problem = "; ".join(port_issues(new.ports, base.ports if old_ok else None))
-    new.radio_problem = "; ".join(radio_issues(new.radio, base.radio if old_ok else None))
+    new.radio_problem = "; ".join(radio_issues(new.radio, base.radio if old_ok else None)
+                                  + wlan_flap_issues(new.wireless, base.wireless if old_ok else None))
     new.changes = merge_changes(base.changes if base is not None else "", inventory_changes(base, new))
-    parts = []
-    if new.changes:
-        parts.append("Изменено: " + new.changes)
-    if new.port_problem:
-        parts.append("Порт: " + new.port_problem)
-    if new.radio_problem:
-        parts.append("Радио: " + new.radio_problem)
+    parts = status_parts(new)
     if parts:
         new.status = " | ".join(parts)
+
+
+# Problems the operator has accepted with «Подтвердить» (Device.confirmed) stop
+# colouring the row and matching the problem filters; changes cannot be confirmed
+# (a backup saves them).
+PROBLEM_KINDS = ("error", "port", "radio")
+
+
+def problem_kinds(dev) -> List[str]:
+    """Problems the device has now: a failed connection / operation, ports, radio."""
+    return [kind for kind, flag in (("error", dev.failed), ("port", dev.port_problem),
+                                    ("radio", dev.radio_problem)) if flag]
+
+
+def open_problem(dev, kind: str) -> bool:
+    """The device has this problem and it is not confirmed."""
+    return kind in problem_kinds(dev) and kind not in (dev.confirmed or [])
+
+
+def status_parts(dev) -> List[str]:
+    parts = []
+    if dev.changes:
+        parts.append("Изменено: " + dev.changes)
+    if open_problem(dev, "port"):
+        parts.append("Порт: " + dev.port_problem)
+    if open_problem(dev, "radio"):
+        parts.append("Радио: " + dev.radio_problem)
+    return parts
