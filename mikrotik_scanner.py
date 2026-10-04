@@ -62,12 +62,13 @@ DATA_COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last see
                 "Last Backup", "Status", "Note")
 # left to right in the table: the favourite star, the data, the signal levels (shown
 # only while the «Слабое радио» filter is on), the Winbox button and the note
-TREE_COLUMNS = ("fav",) + DATA_COLUMNS[:-1] + ("signal", "winbox", "Note")
-EXTRA_COLUMNS = ("fav", "signal", "winbox")   # not data: not sorted, copied or exported
+TREE_COLUMNS = ("fav",) + DATA_COLUMNS[:-1] + ("signal", "ping", "winbox", "Note")
+EXTRA_COLUMNS = ("fav", "signal", "ping", "winbox")   # not data: not sorted or exported
 HEADINGS = {
     "IP": "IP", "Identity": "Identity", "Board Name": "Модель", "RouterOS": "RouterOS",
     "License": "License", "Last seen": "Был в сети", "Last Backup": "Последний бэкап",
     "Status": "Статус", "winbox": "Winbox", "Note": "Заметка", "fav": "★", "signal": "Сигнал",
+    "ping": "Ping",
 }
 HEALTH_FIELDS = ("serial", "ports", "wireless", "radio", "extended",
                  "port_problem", "radio_problem", "changes")
@@ -78,7 +79,7 @@ CSV_ALIASES = {**{v: k for k, v in HEADINGS.items()}, **{k: k for k in DATA_COLU
 # default column widths, in characters of the current font (so they fit any font/DPI)
 DEFAULT_CHARS = {"IP": 14, "Identity": 18, "Board Name": 13, "RouterOS": 10, "License": 7,
                  "Last seen": 19, "Last Backup": 19, "Status": 18, "winbox": 8, "Note": 26,
-                 "fav": 1, "signal": 24}
+                 "fav": 1, "signal": 24, "ping": 9}
 TIME_FORMAT = core.TIME_FORMAT
 WINBOX_LABEL = "▶ Winbox"  # per-row launcher
 MAX_OPS_THREADS = 10  # Backup / SEND run this many devices at once at most
@@ -153,6 +154,8 @@ class ScannerApp:
         self.var_confirmed = BooleanVar(value=False)
         self.var_signal_show = BooleanVar(value=False)
         self.var_signal_limit = StringVar()
+        self.var_ping_show = BooleanVar(value=False)
+        self._search_nets: list = []   # subnets typed in the search box (10.20.30.0/24)
         self._signal_limit = None   # the parsed «не лучше» value, dBm
         self._baselines: dict = {}   # iid -> the device as it was before the running scan / update
 
@@ -401,6 +404,8 @@ class ScannerApp:
         signal_entry.bind("<Escape>", lambda e: self.var_signal_limit.set(""))
         ttk.Label(health_row, text="дБм (например −65: показать сигналы −65 и хуже)",
                   foreground="#666").pack(side=LEFT, padx=(4, 0))
+        ttk.Checkbutton(health_row, text="Ping", variable=self.var_ping_show,
+                        command=self._on_filter_change).pack(side=LEFT, padx=(24, 0))
         self.var_signal_limit.trace_add("write", lambda *_: self._on_search_changed())
 
         # table
@@ -667,7 +672,7 @@ class ScannerApp:
     def _row_values(self, dev: Device) -> tuple:
         row = dev.as_row()
         row.update(winbox=WINBOX_LABEL, fav=FAV_MARK if dev.favorite else "",
-                   signal=health.signal_text(dev.radio))
+                   signal=health.signal_text(dev.radio), ping=dev.ping)
         return tuple(row[c] for c in TREE_COLUMNS)
 
     def _row_image(self, iid: str):
@@ -706,8 +711,10 @@ class ScannerApp:
 
     @staticmethod
     def _search_text(dev: Device) -> str:
+        """What the search box looks in: the columns, and every IP of the device
+        (also the ones not shown: other interfaces, client addresses)."""
         row = dev.as_row()
-        return " ".join(row[c] for c in DATA_COLUMNS).lower()
+        return " ".join([row[c] for c in DATA_COLUMNS] + core.all_ips(dev)).lower()
 
     def _matches_filter(self, dev: Device) -> bool:
         if self._models_sel and self._model_key(dev) not in self._models_sel:
@@ -733,6 +740,9 @@ class ScannerApp:
         months = self._age_months()
         if months and not core.backup_older_than(dev.last_backup, months):
             return False
+        for net in self._search_nets:
+            if not any(core.ip_in_subnet(ip, net) for ip in core.all_ips(dev)):
+                return False
         if self._search_words:
             text = self._search_text(dev)
             if not all(word in text for word in self._search_words):
@@ -800,8 +810,10 @@ class ScannerApp:
         return -abs(value)
 
     def _show_signal_column(self, show: bool) -> None:
-        """The «Сигнал» column is there only with «Сигнал», «Слабое радио» or a «не лучше» value."""
-        self.tree.configure(displaycolumns=[c for c in TREE_COLUMNS if show or c != "signal"])
+        """The «Сигнал» column is there only with «Сигнал», «Слабое радио» or a «не лучше» value;
+        «Ping» only with its checkbox."""
+        hidden = ({"signal"} if not show else set()) | ({"ping"} if not self.var_ping_show.get() else set())
+        self.tree.configure(displaycolumns=[c for c in TREE_COLUMNS if c not in hidden])
 
     def _on_search_changed(self) -> None:
         """Typing in the search box filters the table (after a short pause)."""
@@ -817,9 +829,13 @@ class ScannerApp:
                 pass
         self._search_job = None
         words = self.var_find.get().lower().split()
+        nets = [core.parse_subnet(w) for w in words]
+        words = [w for w, net in zip(words, nets) if net is None]   # a subnet matches addresses in it
+        nets = [net for net in nets if net is not None]
         limit = self._parse_signal_limit(self.var_signal_limit.get())
-        if words != self._search_words or limit != self._signal_limit:
+        if words != self._search_words or nets != self._search_nets or limit != self._signal_limit:
             self._search_words = words
+            self._search_nets = nets
             self._signal_limit = limit
             self._on_filter_change()
 
@@ -836,6 +852,7 @@ class ScannerApp:
         self.var_age.set(AGE_CHOICES[0][0])
         self.var_find.set("")
         self._search_words = []
+        self._search_nets = []
         if self._search_job is not None:
             self.root.after_cancel(self._search_job)
             self._search_job = None
@@ -959,7 +976,7 @@ class ScannerApp:
         stale = [i for i, d in self.devices.items() if d.ip == dev.ip and i != iid]
         # a rescan builds a fresh Device that knows nothing about backups or notes
         previous = [p for p in [self.devices.get(iid)] + [self.devices[i] for i in stale] if p]
-        for attr in ("last_backup", "note", "favorite", "confirmed"):
+        for attr in ("last_backup", "note", "favorite", "confirmed", "main_ip", "ping"):
             if not getattr(dev, attr):
                 setattr(dev, attr, next((getattr(p, attr) for p in previous if getattr(p, attr)),
                                         getattr(dev, attr)))
@@ -967,6 +984,10 @@ class ScannerApp:
             # a CSV row knows nothing about ports, radio or changes: keep what the table had
             for attr in HEALTH_FIELDS:
                 setattr(dev, attr, copy.deepcopy(getattr(previous[0], attr)))
+        if dev.main_ip and dev.ip != dev.main_ip:
+            if not dev.connect_ip:
+                dev.connect_ip = dev.ip
+            dev.ip = dev.main_ip   # the address the operator chose is the one shown
         for other in stale:
             if other in self.checked:
                 self.checked.discard(other)
@@ -1026,6 +1047,8 @@ class ScannerApp:
                 self.on_update_one(iid)
         elif self._shown_column(col) == "winbox":
             self.on_winbox(iid)
+        elif self._shown_column(col) == "ping":
+            self.on_ping(iid)
         elif self._shown_column(col) == "fav":
             self._set_favorite([iid], not self.devices[iid].favorite)
 
@@ -1189,6 +1212,8 @@ class ScannerApp:
                              state="normal" if value else "disabled",
                              command=lambda: self._copy_text(value))
         menu.add_command(label="Копировать строку", command=lambda: self._copy_text(row_text))
+        if name == "IP":
+            menu.add_command(label="Показать все IP…", command=lambda: self._show_all_ips(iid))
         menu.add_separator()
         menu.add_command(label="Изменить заметку…", command=lambda: self._edit_note(iid))
         confirmed = bool(self.devices[iid].confirmed) and not self._unconfirmed(self.devices[iid])
@@ -1281,10 +1306,12 @@ class ScannerApp:
         self._baselines = {}
 
         def work():
-            ip = dev.reach_ip
+            hosts = core.connect_candidates(dev) or [dev.ip]
+            ip = hosts[0]
             try:
-                fresh = self._poll_host(ip, cfg, dev.ip)
+                fresh = self._poll_host(ip, cfg, hosts[1:])
                 fresh = dedupe_devices([fresh])[0]  # keep bridge1 as the shown IP
+                self._ping_device(fresh)
                 fresh.last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.log(f"{ip}: обновлено {fresh.identity or fresh.board_name} [{fresh.status}]")
                 self.ui_queue.put(("device", fresh))
@@ -1293,6 +1320,122 @@ class ScannerApp:
                 self.ui_queue.put(("status", (iid, f"Ошибка: {type(exc).__name__}: {exc}", True)))
             self.ui_queue.put(("save_devices", None))
 
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- every IP of a device, and the choice of the main one
+    @staticmethod
+    def _ip_rows(dev: Device) -> list:
+        """(ip, interface, what it is, can be the main IP) for the «Все IP» window."""
+        rows, seen = [], set()
+        for entry in core.address_entries(dev.addresses):
+            kind = {"own": "свой", "dynamic": "динамический (в изменениях не учитывается)",
+                    "client": f"клиент: network на {entry['address']}, не подключаемся"}[entry["kind"]]
+            if entry["disabled"]:
+                kind += ", выключен"
+            rows.append((entry["ip"], entry["interface"], kind, entry["kind"] != "client"))
+            seen.add(entry["ip"])
+        for ip, what in ((dev.connect_ip, "адрес, по которому устройство найдено"), (dev.ip, "адрес в таблице")):
+            if ip and ip not in seen:
+                rows.insert(0, (ip, "", what, True))
+                seen.add(ip)
+        return rows
+
+    def _show_all_ips(self, iid: str) -> None:
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Все IP — {dev.identity or dev.ip}")
+        win.transient(self.root)
+        info = ttk.Label(win, justify="left")
+        info.pack(anchor="w", padx=8, pady=(8, 4))
+        body = ttk.Frame(win)
+        body.pack(fill=BOTH, expand=True, padx=8)
+        rows = self._ip_rows(dev)
+        tv = ttk.Treeview(body, columns=("ip", "iface", "kind"), show="headings", selectmode="browse",
+                          height=min(max(len(rows), 4), 16))
+        for col, text, width in (("ip", "IP", 130), ("iface", "Интерфейс", 120), ("kind", "Что это", 460)):
+            tv.heading(col, text=text)
+            tv.column(col, width=width, anchor="w")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=RIGHT, fill=Y)
+        tv.pack(side=LEFT, fill=BOTH, expand=True)
+
+        def fill():
+            tv.delete(*tv.get_children())
+            for i, (ip, iface, kind, _ok) in enumerate(self._ip_rows(dev)):
+                mark = "★ основной · " if ip == dev.ip else ""
+                tv.insert("", END, iid=str(i), values=(ip, iface, mark + kind))
+            info.configure(text=f"Основной IP: {dev.ip}" + (" (выбран вручную)" if dev.main_ip else
+                                                              " (автоматически: адрес на bridge1)")
+                           + "\nПодключение — через основной, если он не отвечает — через другие свои адреса.")
+
+        def chosen():
+            sel = tv.selection()
+            return self._ip_rows(dev)[int(sel[0])] if sel else None
+
+        def make_main():
+            row = chosen()
+            if row is None:
+                return
+            if not row[3]:
+                messagebox.showinfo("Основной IP", "Это адрес клиента (network), он не может быть основным.",
+                                    parent=win)
+                return
+            self._set_main_ip(iid, row[0])
+            fill()
+
+        def automatic():
+            self._set_main_ip(iid, "")
+            fill()
+
+        buttons = ttk.Frame(win)
+        buttons.pack(fill=X, padx=8, pady=8)
+        ttk.Button(buttons, text="Сделать основным", command=make_main).pack(side=LEFT)
+        ttk.Button(buttons, text="Автоматически", command=automatic).pack(side=LEFT, padx=4)
+        ttk.Button(buttons, text="Копировать все",
+                   command=lambda: self._copy_text("\n".join(f"{r[0]}\t{r[1]}\t{r[2]}"
+                                                             for r in self._ip_rows(dev)))).pack(side=LEFT, padx=4)
+        ttk.Button(buttons, text="Закрыть", command=win.destroy).pack(side=RIGHT)
+        tv.bind("<Double-Button-1>", lambda e: make_main())
+        win.bind("<Escape>", lambda e: win.destroy())
+        fill()
+        self._ips_dialog = win   # for tests
+
+    def _set_main_ip(self, iid: str, ip: str) -> None:
+        """Choose the IP shown in the table and tried first ('' = automatic: bridge1)."""
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        if not dev.connect_ip:
+            dev.connect_ip = dev.ip
+        dev.main_ip = ip
+        dev.ip = ip or core.bridge_ip(dev.addresses) or dev.connect_ip or dev.ip
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=self._row_values(dev))
+        self._apply_visibility(iid)
+        self._save_devices()
+        self.log(f"{dev.identity or dev.ip}: основной IP — {ip or 'автоматически'} ({dev.ip})")
+
+    def _ping_device(self, dev: Device) -> None:
+        """Ping the address the device was last reached at (worker threads)."""
+        host = dev.connect_ip or dev.ip
+        if host:
+            dev.ping = core.ping_text(core.ping(host))
+
+    def on_ping(self, iid: str) -> None:
+        """Click on a «Ping» cell: ping that device again."""
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        self.tree.set(iid, "ping", "…")
+
+        def work():
+            self._ping_device(dev)
+            self.log(f"{dev.ip}: ping {dev.connect_ip or dev.ip} — {dev.ping}")
+            self.ui_queue.put(("row", iid))
+            self.ui_queue.put(("save_devices", None))
         threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
@@ -1627,12 +1770,10 @@ class ScannerApp:
             return
         targets, alternatives = [], {}
         for iid in self._visible_iids():
-            dev = self.devices[iid]
-            ip = dev.reach_ip
-            if ip and ip not in targets:
-                targets.append(ip)
-                if dev.ip and dev.ip != ip:
-                    alternatives[ip] = dev.ip   # bridge1 address, for SSH
+            hosts = core.connect_candidates(self.devices[iid])
+            if hosts and hosts[0] not in targets:
+                targets.append(hosts[0])
+                alternatives[hosts[0]] = hosts[1:]   # tried when the first one does not answer
         if not targets:
             messagebox.showinfo("Обновить", "В таблице нет устройств для обновления. Сначала выполните «Скан».")
             return
@@ -1648,27 +1789,32 @@ class ScannerApp:
                         "Примеры: 192.168.0.0/24, 10.20.76.112/28, 192.168.0.10-20, 192.168.0.5")
             return None
 
-    def _poll_host(self, ip: str, cfg: dict, alt_ip: str = "") -> Device:
-        """Poll one device with the selected transport. Over SSH, `alt_ip` (the
-        bridge1 address of a device already in the table) is tried when SSH does
-        not answer on `ip` at all, like «Отправить» and «Бэкап» do."""
+    def _poll_host(self, ip: str, cfg: dict, alternates=()) -> Device:
+        """Poll one device with the selected transport. When nothing answers on `ip`,
+        the device's other own addresses (`alternates`, see core.connect_candidates:
+        never client addresses) are tried in turn."""
         if cfg["cmdtype"] == "SSH":
-            from ssh_client import SSHStageError, scan_host_ssh
+            from ssh_client import scan_host_ssh
 
             def poll(host: str) -> Device:
                 return scan_host_ssh(host, cfg["user"], cfg["password"], port=cfg["ssh_port"],
                                      timeout=cfg["timeout"], retries=cfg["retries"],
                                      logger=self.logger)
+        else:
+            def poll(host: str) -> Device:
+                return core.scan_host(host, cfg["user"], cfg["password"], cfg["api_ssl_port"],
+                                      plain_port=8728, timeout=cfg["timeout"], retries=cfg["retries"],
+                                      logger=self.logger)
+        hosts = [ip] + [h for h in alternates if h != ip]
+        for i, host in enumerate(hosts):
             try:
-                return poll(ip)
-            except SSHStageError as exc:
-                if not (exc.unreachable and alt_ip and alt_ip != ip):
-                    raise
-                self.log(f"{ip}: {exc}; пробую адрес bridge1 {alt_ip}")
-                return poll(alt_ip)
-        return core.scan_host(ip, cfg["user"], cfg["password"], cfg["api_ssl_port"],
-                              plain_port=8728, timeout=cfg["timeout"], retries=cfg["retries"],
-                              logger=self.logger)
+                return poll(host)
+            except Exception as exc:  # noqa: BLE001
+                if i + 1 < len(hosts) and core.is_unreachable(exc):
+                    self.log(f"{host}: не отвечает ({exc}); пробую другой адрес устройства {hosts[i + 1]}")
+                    continue
+                raise
+        raise RuntimeError("нет адресов для подключения")
 
     def _start_scan(self, targets: list[str], kind: str, alternatives: dict | None = None) -> None:
         alternatives = alternatives or {}
@@ -1684,8 +1830,9 @@ class ScannerApp:
 
         def scan_one(ip: str) -> bool:
             try:
-                dev = self._poll_host(ip, cfg, alternatives.get(ip, ""))
+                dev = self._poll_host(ip, cfg, alternatives.get(ip, ()))
                 dev.last_seen = datetime.now().strftime(TIME_FORMAT)
+                self._ping_device(dev)
                 self.log(f"{ip}: найдено {dev.identity or dev.board_name or 'RouterOS'} "
                          f"[{dev.status}]")
                 self.ui_queue.put(("device", dev))  # show it right away
@@ -1764,14 +1911,16 @@ class ScannerApp:
         try:
             if cfg["cmdtype"] == "SSH":
                 from ssh_client import run_ssh_command
-                out = self._ssh_try_addresses(dev, cfg, lambda host: run_ssh_command(
+                out = self._try_addresses(dev, lambda host: run_ssh_command(
                     host, cfg["user"], cfg["password"], command,
                     port=cfg["ssh_port"], timeout=cfg["timeout"], retries=cfg["retries"],
                 ))
             else:
                 out = self._run_api_commands(dev, command, cfg)
             self.log(f"--- {dev.ip} ({dev.identity}) через {self._via(dev, cfg)} ---\n{out}")
+            self._ping_device(dev)
             self.ui_queue.put(("status", (iid, "Команда выполнена", False)))
+            self.ui_queue.put(("row", iid))
             return True
         except Exception as exc:  # noqa: BLE001
             self.log(f"{dev.ip} (через {self._via(dev, cfg)}): ошибка команды: "
@@ -1788,10 +1937,7 @@ class ScannerApp:
     def _run_api_commands(self, dev: Device, command: str, cfg: dict) -> str:
         """Each line is one API sentence, sent exactly as typed (no conversion)."""
         sentences = [(line.strip(), split_api_line(line)) for line in command.splitlines() if line.strip()]
-        api = core.open_device_api(
-            dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
-            timeout=cfg["timeout"], logger=self.logger,
-        )
+        api = self._open_api(dev, cfg)
         chunks = []
         try:
             for line, words in sentences:
@@ -1824,10 +1970,7 @@ class ScannerApp:
                 text = self._ssh_export(dev, cfg)
             else:
                 try:
-                    api = core.open_device_api(
-                        dev, cfg["user"], cfg["password"], cfg["api_ssl_port"],
-                        timeout=cfg["timeout"], logger=self.logger,
-                    )
+                    api = self._open_api(dev, cfg)
                     try:
                         text = core.fetch_export(api, logger=self.logger)
                     finally:
@@ -1843,6 +1986,7 @@ class ScannerApp:
                 fh.write(text + "\n")
             dev.last_backup = datetime.now().strftime(TIME_FORMAT)
             dev.changes = ""   # the backup has saved them: the device is no longer «changed»
+            self._ping_device(dev)
             self.log(f"{dev.ip}: бэкап сохранён -> Backups/{fname}"
                      + (f"; прежних бэкапов перенесено в Backups/Old: {len(moved)}" if moved else ""))
             self.ui_queue.put(("status", (iid, f"Бэкап: {fname}", False)))
@@ -1854,24 +1998,32 @@ class ScannerApp:
             self.ui_queue.put(("status", (iid, f"Ошибка бэкапа: {exc}", True)))
             return False
 
-    def _ssh_try_addresses(self, dev: Device, cfg: dict, action):
-        """Run action(host) over SSH on the scanned address, then on the
-        bridge1 address if the first one's SSH port does not answer at all
-        (SSH is often allowed only on the management/bridge network)."""
-        from ssh_client import SSHStageError
-        hosts = [dev.reach_ip] + ([dev.ip] if dev.ip and dev.ip != dev.reach_ip else [])
+    def _try_addresses(self, dev: Device, action):
+        """Run action(host) on the device's main / connection address, then on its
+        other own addresses while nothing answers (never on client addresses).
+        Remembers the address that worked as the connection address."""
+        hosts = core.connect_candidates(dev) or [dev.reach_ip]
         for i, host in enumerate(hosts):
             try:
-                return action(host)
-            except SSHStageError as exc:
-                if exc.unreachable and i + 1 < len(hosts):
-                    self.log(f"{dev.ip}: {exc}; пробую адрес bridge1 {hosts[i + 1]}")
+                result = action(host)
+                dev.connect_ip = host
+                return result
+            except Exception as exc:  # noqa: BLE001
+                if i + 1 < len(hosts) and core.is_unreachable(exc):
+                    self.log(f"{dev.ip}: {host} не отвечает ({exc}); пробую {hosts[i + 1]}")
                     continue
                 raise
 
+    def _open_api(self, dev: Device, cfg: dict):
+        def connect(host: str):
+            return core.open_device_api(dataclasses.replace(dev, connect_ip=host), cfg["user"],
+                                        cfg["password"], cfg["api_ssl_port"],
+                                        timeout=cfg["timeout"], logger=self.logger)
+        return self._try_addresses(dev, connect)
+
     def _ssh_export(self, dev: Device, cfg: dict) -> str:
         from ssh_client import export_config
-        return self._ssh_try_addresses(dev, cfg, lambda host: export_config(
+        return self._try_addresses(dev, lambda host: export_config(
             host, cfg["user"], cfg["password"],
             port=cfg["ssh_port"], timeout=max(cfg["timeout"], 20.0), retries=cfg["retries"],
         ))

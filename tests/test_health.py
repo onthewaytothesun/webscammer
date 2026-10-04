@@ -61,7 +61,7 @@ def test_radio_weak_signal_and_a_drop_since_the_previous_update():
 def _full(**kw):
     base = dict(ip="10.0.0.1", identity="R1", board_name="RB951", routeros="6.49", license="4",
                 serial="S1", key="S1", extended=True,
-                addresses=[{"address": "10.0.0.1/24", "interface": "bridge1"}],
+                addresses=[{"address": "10.0.0.1/24", "interface": "bridge1", "network": "10.0.0.0"}],
                 wireless=[{"name": "wlan1", "ssid": "net", "radio_name": "r1"}])
     base.update(kw)
     return Device(**base)
@@ -69,11 +69,11 @@ def _full(**kw):
 
 def test_changes_are_found_and_kept_until_a_backup():
     before = _full()
-    after = _full(identity="R1-new", addresses=[{"address": "10.0.0.1/24", "interface": "bridge1"},
-                                                {"address": "10.9.9.1/24", "interface": "ether2"}],
+    after = _full(identity="R1-new", addresses=[{"address": "10.0.0.1/24", "interface": "bridge1", "network": "10.0.0.0"},
+                                                {"address": "10.9.9.1/24", "interface": "ether2", "network": "10.9.9.0"}],
                   wireless=[{"name": "wlan1", "ssid": "net2", "radio_name": "r1"}])
     health.analyse(after, before)
-    assert after.changes == "имя: R1 → R1-new; wlan1 SSID: net → net2; адреса: +10.9.9.1/24", after.changes
+    assert after.changes == "имя: R1 → R1-new; wlan1 SSID: net → net2; адреса: +10.9.9.1", after.changes
     assert after.status.startswith("Изменено: имя")
     again = _full(identity="R1-new", addresses=after.addresses, wireless=after.wireless)
     health.analyse(again, after)               # nothing new, but not saved by a backup yet
@@ -136,7 +136,7 @@ def test_api_without_wireless_package_is_fine():
 
 def test_ssh_health_script_is_isolated_and_its_reply_parsed():
     script = ssh_client._health_script()
-    assert script.count("[[:parse ") == 7 and script.endswith(':put "__MTSCAN__health=1"')
+    assert script.count("[[:parse ") == 8 and script.endswith(':put "__MTSCAN__health=1"')
     assert ssh_client._rsc_string('a "b" $x \\ y') == '"a \\"b\\" \\$x \\\\ y"'
     reply = """__MTSCAN__eth=ether1|true
 __MTSCAN__eth=ether2|false
@@ -197,3 +197,65 @@ def test_confirmed_problems_leave_the_status_but_changes_stay():
     assert health.open_problem(dev, "port") and not health.open_problem(dev, "radio")
     assert health.status_parts(dev) == ["Изменено: имя: A → B", "Порт: ether1 10Mbps full-duplex"]
     assert health.worst_signal([{"rx": -60, "tx": -71}, {"rx": -65, "tx": None}]) == -71
+
+
+ADDRS = [
+    {"address": "10.20.58.33/28", "interface": "bridge1", "network": "10.20.58.32", "dynamic": False},
+    {"address": "10.20.24.132/29", "interface": "ether5", "network": "10.20.24.128", "dynamic": False},
+    {"address": "45.87.140.1/32", "interface": "vlan_2", "network": "45.87.140.114", "dynamic": False},
+    {"address": "45.87.140.1/32", "interface": "vlan_3", "network": "45.87.140.115", "dynamic": False},
+    {"address": "192.168.88.10/24", "interface": "ether1", "network": "192.168.88.0", "dynamic": True},
+    {"address": "10.255.0.1/32", "interface": "lo", "network": "10.255.0.1", "dynamic": False},
+]
+
+
+def test_address_kinds_own_client_network_and_dynamic():
+    entries = {(e["ip"], e["kind"]) for e in core.address_entries(ADDRS)}
+    assert entries == {("10.20.58.33", "own"), ("10.20.24.132", "own"), ("45.87.140.114", "client"),
+                       ("45.87.140.115", "client"), ("192.168.88.10", "dynamic"), ("10.255.0.1", "own")}
+    assert health.tracked_ips(ADDRS) == {"10.20.58.33", "10.20.24.132", "45.87.140.114", "45.87.140.115",
+                                         "10.255.0.1"}
+
+
+def test_connections_never_go_to_client_addresses():
+    dev = Device(ip="10.20.58.33", connect_ip="10.20.24.132", addresses=ADDRS)
+    assert core.connect_candidates(dev) == ["10.20.24.132", "10.20.58.33", "10.255.0.1", "192.168.88.10"]
+    dev.main_ip = "10.255.0.1"
+    assert core.connect_candidates(dev)[0] == "10.255.0.1"
+    assert "45.87.140.114" in core.all_ips(dev) and "45.87.140.1" not in core.all_ips(dev)
+
+
+def test_dynamic_addresses_are_not_changes_but_client_networks_are():
+    before = _full(addresses=ADDRS)
+    after = _full(addresses=[dict(a, address="192.168.88.77/24") if a["dynamic"] else a for a in ADDRS[:3]]
+                  + ADDRS[4:])
+    health.analyse(after, before)
+    assert after.changes == "адреса: −45.87.140.115", after.changes
+
+
+def test_unreachable_tells_a_silent_address_from_a_wrong_password():
+    from routeros_api import RouterOSAuthError
+    assert core.is_unreachable(ConnectionRefusedError()) and core.is_unreachable(TimeoutError())
+    assert not core.is_unreachable(RouterOSAuthError("bad")) and not core.is_unreachable(RouterOSError("x"))
+    assert core.is_unreachable(ssh_client.SSHStageError("x", unreachable=True))
+    assert not core.is_unreachable(ssh_client.SSHStageError("login"))
+
+
+def test_ping_reads_linux_and_windows_output_in_any_language():
+    import subprocess
+
+    class Done:
+        def __init__(self, out):
+            self.stdout = out
+    real = subprocess.run
+    try:
+        subprocess.run = lambda *a, **k: Done(b"64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=0.42 ms")
+        assert core.ping("10.0.0.1", platform="linux") == 0.42
+        subprocess.run = lambda *a, **k: Done("Ответ от 10.0.0.1: число байт=32 время=14мс TTL=64".encode("cp866"))
+        assert core.ping("10.0.0.1", platform="win32") == 14
+        subprocess.run = lambda *a, **k: Done(b"Reply from 10.0.0.254: Destination host unreachable.")
+        assert core.ping("10.0.0.1", platform="win32") is None
+    finally:
+        subprocess.run = real
+    assert core.ping_text(None) == "нет ответа" and core.ping_text(0.4) == "<1 мс" and core.ping_text(14) == "14 мс"
+    assert core.parse_subnet("10.20.30.0/24") and core.parse_subnet("10.20.30.1") is None

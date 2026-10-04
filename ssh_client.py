@@ -362,6 +362,9 @@ def _health_script() -> str:
         ':local v ($s->$c); :if ([:len $v] > 0) do={:put ("__MTSCAN__err=" . ($s->"name") . "|" . $c . "|" . $v)}}}',
         ':foreach i in=[/interface find where type="ether"] do={:foreach c in={"rx-error";"tx-error"} do={'
         ':do {:put ("__MTSCAN__err=" . [/interface get $i name] . "|" . $c . "|" . [/interface get $i $c])} on-error={}}}',
+        ':foreach i in=[/ip address find] do={:put ("__MTSCAN__addr2=" . [/ip address get $i address] . "|" . '
+        '[/ip address get $i interface] . "|" . [/ip address get $i network] . "|" . '
+        '[/ip address get $i dynamic] . "|" . [/ip address get $i disabled])}',
         ':foreach i in=[/interface wireless find] do={:put ("__MTSCAN__wlan=" . [/interface wireless get $i name] . "|" . '
         '[/interface wireless get $i disabled] . "|" . [/interface wireless get $i running] . "|" . '
         '[/interface wireless get $i radio-name] . "|" . [/interface wireless get $i ssid])}',
@@ -379,6 +382,7 @@ def parse_health(lines: List[str], dev) -> None:
     import health
     ports: Dict[str, Dict] = {}
     link_downs: Dict[str, Optional[int]] = {}
+    addresses: List[Dict] = []
     done = False
 
     def port(name: str) -> Dict:
@@ -408,6 +412,9 @@ def parse_health(lines: List[str], dev) -> None:
         elif key == "reg" and len(fields) >= 4:
             dev.radio.append({"interface": fields[0], "mac": fields[1],
                               "rx": health.parse_signal(fields[2]), "tx": health.parse_signal(fields[3])})
+        elif key == "addr2" and len(fields) >= 5:
+            addresses.append({"address": fields[0], "interface": fields[1], "network": fields[2],
+                              "dynamic": fields[3] == "true", "disabled": fields[4] == "true"})
         elif key == "health":
             done = True
     for name, downs in link_downs.items():
@@ -415,6 +422,8 @@ def parse_health(lines: List[str], dev) -> None:
             ports[name]["link_downs"] = downs
     for wlan in dev.wireless:
         wlan["link_downs"] = link_downs.get(wlan["name"])
+    if addresses:   # with network / dynamic, which the plain inventory line lacks
+        dev.addresses = addresses
     dev.ports = list(ports.values())
     dev.extended = done
 

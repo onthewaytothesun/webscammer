@@ -58,8 +58,9 @@ def test_gui_builds_with_all_row_actions():
         assert list(M.DATA_COLUMNS).index("Last Backup") == list(M.DATA_COLUMNS).index("Last seen") + 1
         shown = [app.tree.heading(c, "text") for c in columns]
         assert shown == ["★", "IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
-                         "Последний бэкап", "Статус", "Сигнал", "Winbox", "Заметка"], shown
+                         "Последний бэкап", "Статус", "Сигнал", "Ping", "Winbox", "Заметка"], shown
         assert "signal" not in app.tree.cget("displaycolumns")   # only with «Слабое радио»
+        assert "ping" not in app.tree.cget("displaycolumns")     # only with «Ping»
     finally:
         app._on_close()
 
@@ -680,7 +681,7 @@ def test_gui_search_box_filters_the_table_and_covers_notes():
         assert search("R3") == ["SN3"]                             # identity
         assert search("hap") == ["SN2", "SN4", "SN6"]              # model
         assert search("10.0.0.4") == ["SN4"]                       # the IP that is shown
-        assert search("10.20.30.4") == []                          # the hidden «IP подключения» is not searched
+        assert search("10.20.30.4") == ["SN4"]                     # hidden addresses are searched too
         assert search("zzz") == []
         app._tick()
         assert "показано 0" in app.lbl_counts.cget("text")
@@ -969,7 +970,7 @@ def test_gui_everything_the_user_sees_is_in_russian():
         texts += [app.tree.heading(c, "text") for c in app.tree.cget("columns")]
         texts += [app.notebook.tab(i, "text") for i in range(app.notebook.index("end"))]
         kept = {"IP", "Identity", "RouterOS", "License", "Winbox", "SSH:", "API-SSL:", "Winbox:", "SSH", "API/SSL",
-                "CSV", "▶ Winbox"}
+                "CSV", "▶ Winbox", "Ping"}
         english = [t for t in texts if re.search(r"[A-Za-z]{3,}", t) and t not in kept
                    and not t.startswith(("SSH:", "API/SSL:", "Порт API-SSL:", "Лог: logs/"))]
         assert english == [], english
@@ -1074,7 +1075,7 @@ def test_gui_ssh_update_falls_back_to_the_bridge1_address():
         assert tried.count("10.20.44.209") == 1 and "10.20.44.210" not in tried, tried
         assert not app.devices["SN1"].failed and app.devices["SN1"].reach_ip == "10.20.44.209"
         assert app.devices["SN2"].failed
-        assert "пробую адрес bridge1 10.20.44.209" in app.txt_output.get("1.0", "end")
+        assert "пробую другой адрес устройства 10.20.44.209" in app.txt_output.get("1.0", "end")
 
         tried.clear()                             # the ⟳ button of one row does the same
         app.devices["SN1"].connect_ip = "10.20.30.209"
@@ -1281,4 +1282,55 @@ def test_gui_confirm_hides_problems_but_not_changes_and_the_signal_filter():
         app.var_signal_limit.set(""); app._apply_search()
         assert "signal" not in app.tree.cget("displaycolumns")
     finally:
+        app._on_close()
+
+
+def test_gui_all_ips_main_ip_subnet_search_and_ping():
+    M, tk, root, app = _open()
+    from core import Device
+    import core
+    addrs = [{"address": "10.20.58.33/28", "interface": "bridge1", "network": "10.20.58.32"},
+             {"address": "10.20.24.132/29", "interface": "ether5", "network": "10.20.24.128"},
+             {"address": "45.87.140.1/32", "interface": "vlan_2", "network": "45.87.140.114"}]
+    real_ping = core.ping
+    core.ping = lambda host, timeout=1.0, platform=None: 7.0
+    try:
+        app._upsert_device(Device(ip="10.20.58.33", connect_ip="10.20.24.132", identity="R1", key="S1",
+                                  addresses=addrs))
+        app._upsert_device(Device(ip="10.30.0.1", identity="R2", key="S2"))
+        assert app.tree.set("S1", "IP") == "10.20.58.33"
+        # the client address is found by search, a subnet finds the devices in it
+        app.var_find.set("45.87.140.114"); app._apply_search()
+        assert app._visible_iids() == ["S1"]
+        app.var_find.set("10.20.24.0/24"); app._apply_search()
+        assert app._visible_iids() == ["S1"]
+        app.var_find.set("10.30.0.0/16"); app._apply_search()
+        assert app._visible_iids() == ["S2"]
+        app.var_find.set(""); app._apply_search()
+
+        app._show_all_ips("S1")
+        rows = app._ip_rows(app.devices["S1"])
+        assert [r[0] for r in rows] == ["10.20.58.33", "10.20.24.132", "45.87.140.114"] and rows[2][3] is False
+        app._ips_dialog.destroy()
+
+        app._set_main_ip("S1", "10.20.24.132")
+        assert app.tree.set("S1", "IP") == "10.20.24.132"
+        assert core.connect_candidates(app.devices["S1"])[0] == "10.20.24.132"
+        # a rescan keeps the chosen IP
+        app._upsert_device(Device(ip="10.20.58.33", connect_ip="10.20.58.33", identity="R1", key="S1",
+                                  addresses=addrs))
+        assert app.devices["S1"].main_ip == "10.20.24.132" and app.tree.set("S1", "IP") == "10.20.24.132"
+        app._set_main_ip("S1", "")
+        assert app.tree.set("S1", "IP") == "10.20.58.33"
+
+        app.var_ping_show.set(True); app._on_filter_change()
+        assert "ping" in app.tree.cget("displaycolumns")
+        app.on_ping("S1")
+        for _ in range(50):
+            _pump(root, 1)
+            if app.tree.set("S1", "ping") == "7 мс":
+                break
+        assert app.tree.set("S1", "ping") == "7 мс" and app.devices["S1"].ping == "7 мс"
+    finally:
+        core.ping = real_ping
         app._on_close()

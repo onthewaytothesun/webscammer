@@ -198,12 +198,20 @@ def inventory_changes(old, new) -> List[str]:
             now = (new_wlan.get(name) or {}).get(key, "")
             if before != now:
                 changes.append(f"{name} {label}: {before or '—'} → {now or '—'}")
-    old_addr = {a.get("address") for a in old.addresses}
-    new_addr = {a.get("address") for a in new.addresses}
-    moved = [f"+{a}" for a in sorted(new_addr - old_addr)] + [f"−{a}" for a in sorted(old_addr - new_addr)]
-    if moved:
-        changes.append("адреса: " + ", ".join(moved))
+    # Addresses: own static ones by IP, client ones by the «network» of their /32;
+    # dynamic addresses are ignored. A list read before «network» was collected
+    # cannot tell client addresses apart, so it is not compared.
+    if all("network" in a for a in old.addresses + new.addresses):
+        old_addr, new_addr = tracked_ips(old.addresses), tracked_ips(new.addresses)
+        moved = [f"+{a}" for a in sorted(new_addr - old_addr)] + [f"−{a}" for a in sorted(old_addr - new_addr)]
+        if moved:
+            changes.append("адреса: " + ", ".join(moved))
     return changes
+
+
+def tracked_ips(addresses: List[Dict]) -> set:
+    from core import address_entries
+    return {e["ip"] for e in address_entries(addresses) if e["kind"] != "dynamic"}
 
 
 def merge_changes(previous: str, fresh: List[str]) -> str:

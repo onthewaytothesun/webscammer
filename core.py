@@ -60,6 +60,8 @@ class Device:
     changes: str = ""        # changed since an earlier update and not yet saved by a backup
     favorite: bool = False
     confirmed: List[str] = field(default_factory=list)   # problem kinds accepted with «Подтвердить»
+    main_ip: str = ""   # chosen by the operator: shown in the table and tried first
+    ping: str = ""      # ping to the device at the last interaction ("12 мс" / "нет ответа")
 
     @property
     def reach_ip(self) -> str:
@@ -160,6 +162,124 @@ def bridge_ip(addresses: List[Dict[str, str]]) -> Optional[str]:
         if addr.get("interface") == BRIDGE_INTERFACE:
             return addr.get("address", "").split("/")[0]
     return None
+
+
+# ---------------------------------------------------------------------------
+# The device's addresses: its own, dynamic ones, and client addresses
+# ---------------------------------------------------------------------------
+def address_entries(addresses: List[Dict]) -> List[Dict]:
+    """Every IP the device is known by, one entry each:
+
+      own      a static address of the router (10.20.58.33/28 -> 10.20.58.33)
+      dynamic  an address the router got dynamically (DHCP client etc.)
+      client   an address handed to a client: on a /32 interface address the
+               remote end is in «network» (address=45.87.140.1 network=45.87.140.114
+               -> 45.87.140.114). The /32 address itself (45.87.140.1) is the same
+               on many routers and is not listed.
+
+    Old caches have no «network» / «dynamic»; their addresses count as own."""
+    entries: List[Dict] = []
+    seen = set()
+    for a in addresses:
+        address = a.get("address", "")
+        ip, _, prefix = address.partition("/")
+        if not ip:
+            continue
+        network = a.get("network", "")
+        if prefix == "32" and network and network != ip:
+            kind, ip = "client", network
+        elif a.get("dynamic"):
+            kind = "dynamic"
+        else:
+            kind = "own"
+        if (ip, kind) in seen:
+            continue
+        seen.add((ip, kind))
+        entries.append({"ip": ip, "kind": kind, "interface": a.get("interface", ""),
+                        "address": address, "disabled": bool(a.get("disabled"))})
+    return entries
+
+
+def all_ips(dev: Device) -> List[str]:
+    """Every IP to search by: the table IP, the connection IP, own / dynamic and client ones."""
+    ips = [dev.ip, dev.connect_ip, dev.main_ip] + [e["ip"] for e in address_entries(dev.addresses)]
+    return list(dict.fromkeys(ip for ip in ips if ip))
+
+
+def connect_candidates(dev: Device) -> List[str]:
+    """Addresses to connect to, in order: the chosen main IP, the one the scan reached,
+    the table IP, then the other own static addresses, then dynamic ones. Client
+    addresses and /32 addresses are never used (that would hit the clients)."""
+    entries = address_entries(dev.addresses)
+    never = {e["ip"] for e in entries if e["kind"] == "client"} | {
+        a.get("address", "").split("/")[0] for a in dev.addresses
+        if a.get("address", "").endswith("/32") and a.get("network") not in ("", a.get("address", "").split("/")[0])}
+    order: List[str] = []
+    usable = ([dev.main_ip, dev.connect_ip, dev.ip]
+              + [e["ip"] for e in entries if e["kind"] == "own" and not e["disabled"]]
+              + [e["ip"] for e in entries if e["kind"] == "dynamic" and not e["disabled"]])
+    for ip in usable:
+        if ip and ip not in order and (ip not in never or ip == dev.main_ip):
+            order.append(ip)
+    return order
+
+
+def is_unreachable(exc: BaseException) -> bool:
+    """Nothing answered on that address (so another address may work); a wrong
+    password or a TLS / protocol problem is not that."""
+    unreachable = getattr(exc, "unreachable", None)
+    if unreachable is not None:
+        return bool(unreachable)
+    if isinstance(exc, (RouterOSError, ssl.SSLError)):
+        return False
+    return isinstance(exc, OSError)
+
+
+def ip_in_subnet(ip: str, network) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in network
+    except ValueError:
+        return False
+
+
+def parse_subnet(text: str):
+    """'10.20.30.0/24' -> an ip_network; anything else -> None."""
+    if "/" not in text:
+        return None
+    try:
+        return ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return None
+
+
+_PING_WIN = re.compile(rb"[=<](\d+)\S*\s+TTL=", re.I)
+_PING_UNIX = re.compile(rb"time[=<]\s*([\d.]+)\s*ms", re.I)
+
+
+def ping(host: str, timeout: float = 1.0, platform: Optional[str] = None) -> Optional[float]:
+    """One ICMP echo through the system ping: milliseconds, or None without a reply."""
+    platform = platform or sys.platform
+    windows = platform.startswith("win")
+    if windows:
+        args = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host]
+    elif platform == "darwin":
+        args = ["ping", "-c", "1", "-W", str(int(timeout * 1000)), host]
+    else:
+        args = ["ping", "-c", "1", "-W", str(max(1, int(round(timeout)))), host]
+    kwargs = {"creationflags": 0x08000000} if windows else {}   # CREATE_NO_WINDOW
+    try:
+        out = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             timeout=timeout + 3, **kwargs).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = _PING_UNIX.search(out) or _PING_WIN.search(out)   # Windows prints «время=1мс TTL=64» in any language
+    return float(m.group(1)) if m else None
+
+
+def ping_text(ms: Optional[float]) -> str:
+    if ms is None:
+        return "нет ответа"
+    return "<1 мс" if ms < 1 else f"{ms:.0f} мс"
 
 
 def dedupe_devices(devices: List[Device]) -> List[Device]:
@@ -271,7 +391,9 @@ def _collect_fields(api: RouterOSApi, dev: Device) -> None:
     try:
         addrs = api.talk(["/ip/address/print"])
         dev.addresses = [
-            {"address": a.get("address", ""), "interface": a.get("interface", "")}
+            {"address": a.get("address", ""), "interface": a.get("interface", ""),
+             "network": a.get("network", ""), "dynamic": a.get("dynamic") == "true",
+             "disabled": a.get("disabled") == "true"}
             for a in addrs
         ]
     except RouterOSError:
