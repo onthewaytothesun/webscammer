@@ -57,8 +57,9 @@ def test_gui_builds_with_all_row_actions():
         assert columns[-2:] == ("winbox", "Note") and columns == M.TREE_COLUMNS
         assert list(M.DATA_COLUMNS).index("Last Backup") == list(M.DATA_COLUMNS).index("Last seen") + 1
         shown = [app.tree.heading(c, "text") for c in columns]
-        assert shown == ["IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
-                         "Последний бэкап", "Статус", "Winbox", "Заметка"], shown
+        assert shown == ["★", "IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
+                         "Последний бэкап", "Статус", "Сигнал", "Winbox", "Заметка"], shown
+        assert "signal" not in app.tree.cget("displaycolumns")   # only with «Слабое радио»
     finally:
         app._on_close()
 
@@ -160,10 +161,11 @@ def test_gui_right_click_copies_cell_or_row():
         assert len(row) == len(M.DATA_COLUMNS) and row[:2] == ["10.20.44.209", "R1"]
         assert row[-1] == ""                               # the note is the last data column
         labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1) if menu.type(i) == "command"]
-        assert labels[-1] == "Изменить заметку…", labels
+        assert labels[-2:] == ["Изменить заметку…", "Добавить в избранное"], labels
         icons_menu = right_click("SN1", "#0")              # icons column: no cell to copy, but the row and the note
         assert [icons_menu.entrycget(i, "label") for i in range(icons_menu.index("end") + 1)
-                if icons_menu.type(i) == "command"] == ["Копировать строку", "Изменить заметку…"]
+                if icons_menu.type(i) == "command"] == ["Копировать строку", "Изменить заметку…",
+                                                        "Добавить в избранное"]
     finally:
         tk.Menu.tk_popup = original
         app._on_close()
@@ -1154,5 +1156,73 @@ def test_gui_command_type_and_save_box_end_the_field_row_and_send_has_its_label(
         assert texts[-1] == "Запомнить настройки", texts
         assert "Тип команд:" in texts[-3], texts
         assert app._app_icons
+    finally:
+        app._on_close()
+
+
+def test_gui_changes_ports_radio_favourites_and_their_filters():
+    M, tk, root, app = _open()
+    from core import Device
+    try:
+        def full(**kw):
+            base = dict(ip="10.0.0.1", identity="R1", board_name="RB951", key="S1", serial="S1", extended=True,
+                        addresses=[{"address": "10.0.0.1/24", "interface": "bridge1"}])
+            base.update(kw)
+            return Device(**base)
+        app._upsert_device(full())
+        app._upsert_device(full(ip="10.0.0.2", key="S2", serial="S2", identity="R2"))
+        app._baselines = {}
+        app._accept_polled(full(identity="R1-renamed"))
+        app._accept_polled(full(ip="10.0.0.2", key="S2", serial="S2", identity="R2",
+                                ports=[{"name": "ether1", "running": True, "rate": "10Mbps",
+                                        "full_duplex": "false", "link_downs": 0, "errors": {}}],
+                                radio=[{"interface": "wlan1", "mac": "AA", "rx": -80, "tx": -70}]))
+        _pump(root, 2)
+        assert app.tree.item("S1", "tags") == ("changed",) and "имя: R1 → R1-renamed" in app.devices["S1"].status
+        assert app.tree.item("S2", "tags") == ("port",)
+        assert app.devices["S2"].radio_problem
+
+        app.var_changed_only.set(True); app._on_filter_change()
+        assert app._visible_iids() == ["S1"]
+        app.var_changed_only.set(False); app.var_weak_radio.set(True); app._on_filter_change()
+        assert app._visible_iids() == ["S2"] and "signal" in app.tree.cget("displaycolumns")
+        assert app.tree.set("S2", "signal") == "wlan1 rx -80 / tx -70"
+        app.var_weak_radio.set(False); app._on_filter_change()
+        assert "signal" not in app.tree.cget("displaycolumns")
+
+        app.checked.add("S2")
+        app.on_favorite()
+        assert app.devices["S2"].favorite and app.tree.set("S2", "fav") == "★"
+        app.var_favorites.set(True); app._on_filter_change()
+        assert app._visible_iids() == ["S2"]
+        app._reset_filters(); app._relayout()
+        # a rescan keeps the star, a backup clears «changed»
+        app._baselines = {}
+        app._accept_polled(full(ip="10.0.0.2", key="S2", serial="S2", identity="R2"))
+        assert app.devices["S2"].favorite
+        app.devices["S1"].changes = ""
+        app._handle_ui_message("row", "S1")
+        assert not app.tree.item("S1", "tags")
+    finally:
+        app._on_close()
+
+
+def test_gui_delete_moves_the_devices_backups_to_old():
+    M, tk, root, app = _open()
+    from core import Device
+    try:
+        app._upsert_device(Device(ip="10.0.0.1", identity="R1", key="S1"))
+        path = os.path.join(M.BACKUP_DIR, "10.0.0.1_R1_2026-01-01.rsc")
+        with open(path, "w") as fh:
+            fh.write("x")
+        app.checked.add("S1")
+        original = M.messagebox.askyesno
+        M.messagebox.askyesno = lambda *a, **k: True
+        try:
+            app.on_delete()
+        finally:
+            M.messagebox.askyesno = original
+        assert not os.path.exists(path)
+        assert os.listdir(os.path.join(M.BACKUP_DIR, "Old")) == ["10.0.0.1_R1_2026-01-01.rsc"]
     finally:
         app._on_close()

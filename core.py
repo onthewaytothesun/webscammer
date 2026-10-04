@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
+import health
 from routeros_api import RouterOSApi, RouterOSAuthError, RouterOSError
 
 BRIDGE_INTERFACE = "bridge1"
@@ -48,6 +49,16 @@ class Device:
     api_port: int = 0
     api_ssl: bool = True
     api_ciphers: Optional[str] = None
+    # ports, radio and change tracking (see health.py)
+    serial: str = ""
+    ports: List[Dict] = field(default_factory=list)      # ethernet: name, running, rate, full_duplex, link_downs, errors
+    wireless: List[Dict] = field(default_factory=list)   # name, ssid, radio_name, disabled, running
+    radio: List[Dict] = field(default_factory=list)      # registration table: interface, mac, rx, tx (dBm)
+    extended: bool = False   # the fields above were read (older caches / CSV rows lack them)
+    port_problem: str = ""
+    radio_problem: str = ""
+    changes: str = ""        # changed since an earlier update and not yet saved by a backup
+    favorite: bool = False
 
     @property
     def reach_ip(self) -> str:
@@ -240,7 +251,7 @@ def _collect_fields(api: RouterOSApi, dev: Device) -> None:
     try:
         rb = api.talk(["/system/routerboard/print"])
         if rb:
-            dev.key = rb[0].get("serial-number", "")
+            dev.key = dev.serial = rb[0].get("serial-number", "")
             if not dev.board_name:
                 dev.board_name = rb[0].get("model", "")
     except RouterOSError:
@@ -268,6 +279,54 @@ def _collect_fields(api: RouterOSApi, dev: Device) -> None:
     if not (dev.identity or dev.board_name or dev.routeros):
         # every print was refused: don't report an empty row as "OK"
         raise RouterOSError("роутер не вернул данных (проверьте права пользователя)")
+    _collect_health(api, dev)
+
+
+def _talk_or_empty(api: RouterOSApi, words: List[str]) -> List[Dict[str, str]]:
+    """A print that may not exist here (no wireless package, older RouterOS)."""
+    try:
+        return api.talk(words)
+    except RouterOSError:
+        return []
+
+
+def _collect_health(api: RouterOSApi, dev: Device) -> None:
+    """Ethernet ports (link, rate, duplex, errors, link-downs), wireless settings
+    and the wireless registration table, for health.analyse()."""
+    ports: Dict[str, Dict] = {}
+    rows = (_talk_or_empty(api, ["/interface/ethernet/print", "=stats="])
+            or _talk_or_empty(api, ["/interface/ethernet/print"]))
+    for row in rows:
+        name = row.get("name", "")
+        if name:
+            ports[name] = {"name": name, "running": row.get("running") == "true", "rate": "",
+                           "full_duplex": "", "link_downs": None,
+                           "errors": health.error_counters(row)}
+    for row in _talk_or_empty(api, ["/interface/print", "=.proplist=name,link-downs,rx-error,tx-error,rx-drop,tx-drop"]):
+        port = ports.get(row.get("name", ""))
+        if port is not None:
+            port["link_downs"] = health.to_int(row.get("link-downs"))
+            for name, value in health.error_counters(row).items():
+                port["errors"].setdefault(name, value)
+    for port in ports.values():
+        if port["running"]:
+            mon = _talk_or_empty(api, ["/interface/ethernet/monitor", "=numbers=" + port["name"], "=once="])
+            if mon:
+                port["rate"] = mon[0].get("rate", "")
+                port["full_duplex"] = mon[0].get("full-duplex", "")
+    dev.ports = list(ports.values())
+    dev.wireless = [
+        {"name": r.get("name", ""), "ssid": r.get("ssid", ""), "radio_name": r.get("radio-name", ""),
+         "disabled": r.get("disabled") == "true", "running": r.get("running") == "true"}
+        for r in _talk_or_empty(api, ["/interface/wireless/print"])
+    ]
+    dev.radio = [
+        {"interface": r.get("interface", ""), "mac": r.get("mac-address", ""),
+         "rx": health.parse_signal(r.get("signal-strength", "")),
+         "tx": health.parse_signal(r.get("tx-signal-strength", ""))}
+        for r in _talk_or_empty(api, ["/interface/wireless/registration-table/print"])
+    ]
+    dev.extended = True
 
 
 def _is_auth_failure(exc: Exception) -> bool:
@@ -587,6 +646,34 @@ def latest_backup_file(backup_dir: str, ip: str) -> Optional[str]:
     """Path of the newest backup file for this IP, or None if there is none."""
     found = _newest_backups(backup_dir).get(ip)
     return found[1] if found else None
+
+
+OLD_BACKUP_DIR = "Old"
+
+
+def archive_backups(backup_dir: str, ip: str) -> List[str]:
+    """Move every backup of this IP from backup_dir into backup_dir/Old (a name
+    that is already taken there gets _2, _3…). Returns the new paths."""
+    moved: List[str] = []
+    try:
+        names = sorted(os.listdir(backup_dir))
+    except OSError:
+        return moved
+    old_dir = os.path.join(backup_dir, OLD_BACKUP_DIR)
+    for name in names:
+        m = _BACKUP_NAME.match(name)
+        src = os.path.join(backup_dir, name)
+        if not m or m.group(1) != ip or not os.path.isfile(src):
+            continue
+        os.makedirs(old_dir, exist_ok=True)
+        stem, ext = os.path.splitext(name)
+        dst, n = os.path.join(old_dir, name), 1
+        while os.path.exists(dst):
+            n += 1
+            dst = os.path.join(old_dir, f"{stem}_{n}{ext}")
+        os.replace(src, dst)
+        moved.append(dst)
+    return moved
 
 
 def open_with_default_app(path: str, platform: Optional[str] = None) -> None:

@@ -13,6 +13,7 @@ Run:  python3 mikrotik_scanner.py
 from __future__ import annotations
 
 import base64
+import copy
 import csv
 import dataclasses
 import json
@@ -41,6 +42,7 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 import core
+import health
 import icons
 from applog import setup_logging
 from core import Device, backup_filename, dedupe_devices, expand_targets, split_api_line
@@ -58,19 +60,25 @@ CSV_DELIMITER = ";"  # Excel-friendly in RU locale
 # Winbox deliberately stay as they are).
 DATA_COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last seen",
                 "Last Backup", "Status", "Note")
-TREE_COLUMNS = DATA_COLUMNS[:-1] + ("winbox", "Note")  # left to right in the table
+# left to right in the table: the favourite star, the data, the signal levels (shown
+# only while the «Слабое радио» filter is on), the Winbox button and the note
+TREE_COLUMNS = ("fav",) + DATA_COLUMNS[:-1] + ("signal", "winbox", "Note")
+EXTRA_COLUMNS = ("fav", "signal", "winbox")   # not data: not sorted, copied or exported
 HEADINGS = {
     "IP": "IP", "Identity": "Identity", "Board Name": "Модель", "RouterOS": "RouterOS",
     "License": "License", "Last seen": "Был в сети", "Last Backup": "Последний бэкап",
-    "Status": "Статус", "winbox": "Winbox", "Note": "Заметка",
+    "Status": "Статус", "winbox": "Winbox", "Note": "Заметка", "fav": "★", "signal": "Сигнал",
 }
+HEALTH_FIELDS = ("serial", "ports", "wireless", "radio", "extended",
+                 "port_problem", "radio_problem", "changes")
 MGMT_HEADING = "IP подключения"  # the address the scan reached (CSV only)
 # CSV headers accepted on import: the current names, the key names and the older English ones
 CSV_ALIASES = {**{v: k for k, v in HEADINGS.items()}, **{k: k for k in DATA_COLUMNS},
                "Mgmt IP": "Mgmt IP", MGMT_HEADING: "Mgmt IP"}
 # default column widths, in characters of the current font (so they fit any font/DPI)
 DEFAULT_CHARS = {"IP": 14, "Identity": 18, "Board Name": 13, "RouterOS": 10, "License": 7,
-                 "Last seen": 19, "Last Backup": 19, "Status": 18, "winbox": 8, "Note": 26}
+                 "Last seen": 19, "Last Backup": 19, "Status": 18, "winbox": 8, "Note": 26,
+                 "fav": 1, "signal": 24}
 TIME_FORMAT = core.TIME_FORMAT
 WINBOX_LABEL = "▶ Winbox"  # per-row launcher
 MAX_OPS_THREADS = 10  # Backup / SEND run this many devices at once at most
@@ -79,6 +87,9 @@ IDLE_TEXT = "Нет активных операций"
 ERROR_BG, ERROR_FG = "#ffd6d6", "#7a0000"  # rows of devices whose last operation failed
 # rows whose last backup is older than 3 / 6 / 12 months (also the legend chips)
 AGE_COLORS = {"age3": "#fff1a0", "age6": "#ffc27d", "age12": "#ff8f8f"}
+# changed since the previous update (until a backup saves it) / port problems / weak radio
+STATE_COLORS = {"changed": "#d9b8f5", "port": "#8db4f0", "radio": "#c4ecff"}
+FAV_MARK = "★"
 AGE_CHOICES = (("Любой возраст", 0), ("Старше 3 мес.", 3), ("Старше 6 мес.", 6), ("Старше 12 мес.", 12))
 COMMAND_HINTS = {
     "SSH": "SSH: команды как в терминале RouterOS, например /ip service set ssh port=22",
@@ -135,6 +146,11 @@ class ScannerApp:
         self.var_errors_only = BooleanVar(value=False)
         self.var_no_backup = BooleanVar(value=False)
         self.var_age = StringVar(value=AGE_CHOICES[0][0])
+        self.var_port_issue = BooleanVar(value=False)
+        self.var_weak_radio = BooleanVar(value=False)
+        self.var_changed_only = BooleanVar(value=False)
+        self.var_favorites = BooleanVar(value=False)
+        self._baselines: dict = {}   # iid -> the device as it was before the running scan / update
 
         self._build_ui()
         self._fit_window_to_fields()
@@ -290,6 +306,7 @@ class ScannerApp:
         ttk.Button(actions, text="Обновить", command=self.on_update).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Удалить", command=self.on_delete).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Бэкап", command=self.on_backup).pack(side=LEFT, padx=2)
+        ttk.Button(actions, text="★ Избранное", command=self.on_favorite).pack(side=LEFT, padx=(10, 2))
         ttk.Label(actions, text="Команда:").pack(side=RIGHT, padx=(2, 4))
         ttk.Button(actions, text="Отправить", command=self.on_send).pack(side=RIGHT, padx=2)
 
@@ -336,10 +353,13 @@ class ScannerApp:
             ttk.Label(legend, text=text).pack(side=LEFT)
         tk.Label(legend, width=2, bg=ERROR_BG, bd=1, relief="solid").pack(side=LEFT, padx=(10, 2))
         ttk.Label(legend, text="ошибка").pack(side=LEFT)
+        for tag, text in (("changed", "изменения"), ("port", "порт"), ("radio", "радио")):
+            tk.Label(legend, width=2, bg=STATE_COLORS[tag], bd=1, relief="solid").pack(side=LEFT, padx=(6, 2))
+            ttk.Label(legend, text=text).pack(side=LEFT)
         self.lbl_progress = ttk.Label(info, text=IDLE_TEXT, anchor="w")
         self.lbl_progress.pack(side=LEFT, fill=X, expand=True)
 
-        # filters on the left, how many devices / how many ticked on the right
+        # filters (the device counts are in the bottom bar)
         filters = ttk.Frame(self.root)
         filters.pack(fill=X, padx=6, pady=(4, 0))
         self.btn_models = ttk.Button(filters, width=26, command=self._open_models_dialog)
@@ -353,14 +373,17 @@ class ScannerApp:
                         command=self._on_filter_change).pack(side=LEFT, padx=(12, 0))
         ttk.Checkbutton(filters, text="Только без бэкапов", variable=self.var_no_backup,
                         command=self._on_filter_change).pack(side=LEFT, padx=(12, 0))
-        self.lbl_counts = ttk.Label(filters, anchor="e")
-        self.lbl_counts.pack(side=RIGHT, padx=4)
+        for text, var in (("Только с изменениями", self.var_changed_only),
+                          ("Проблемы с портом", self.var_port_issue),
+                          ("Слабое радио", self.var_weak_radio),
+                          ("Избранное", self.var_favorites)):
+            ttk.Checkbutton(filters, text=text, variable=var,
+                            command=self._on_filter_change).pack(side=LEFT, padx=(12, 0))
         self._update_models_button()
 
         # table
         table_frame = ttk.Frame(self.root)
         table_frame.pack(fill=BOTH, expand=True, padx=6, pady=2)
-        self._winbox_col = "#%d" % (TREE_COLUMNS.index("winbox") + 1)
         self.tree = ttk.Treeview(table_frame, columns=TREE_COLUMNS, show="tree headings", selectmode="none")
         # column #0 holds the checkbox + update button images
         self.tree.heading("#0", image=self._icons[("head", False)], anchor="w",
@@ -368,12 +391,12 @@ class ScannerApp:
         self.tree.column("#0", width=self._icon_w + 14, minwidth=self._icon_w + 6,
                          anchor="w", stretch=False)
         for col in TREE_COLUMNS:
-            if col == "winbox":
+            if col in EXTRA_COLUMNS:
                 self.tree.heading(col, text=HEADINGS[col])
             else:
                 self.tree.heading(col, text=HEADINGS[col], command=lambda c=col: self.sort_by(c))
             self.tree.column(col, width=self._default_width(col), stretch=False,
-                             anchor="center" if col == "winbox" else "w")
+                             anchor="center" if col in ("winbox", "fav") else "w")
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -381,8 +404,9 @@ class ScannerApp:
         hsb.pack(side="bottom", fill=X)
         self.tree.pack(fill=BOTH, expand=True)
         self.tree.tag_configure("error", background=ERROR_BG, foreground=ERROR_FG)
-        for tag, color in AGE_COLORS.items():
+        for tag, color in list(AGE_COLORS.items()) + list(STATE_COLORS.items()):
             self.tree.tag_configure(tag, background=color, foreground="#000000")
+        self._show_signal_column(False)
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
@@ -405,6 +429,9 @@ class ScannerApp:
                   foreground="#666").pack(side=LEFT)
         ttk.Button(bottom, text="Экспорт", command=self.on_export).pack(side=RIGHT, padx=2)
         ttk.Button(bottom, text="Импорт", command=self.on_import).pack(side=RIGHT, padx=2)
+        # how many devices / how many ticked (the filter row above is full)
+        self.lbl_counts = ttk.Label(bottom, anchor="e")
+        self.lbl_counts.pack(side=RIGHT, padx=(4, 12))
 
     def _fit_window_to_fields(self) -> None:
         """Open the window wide enough for the whole field row when the screen
@@ -576,7 +603,7 @@ class ScannerApp:
         if kind == "log":
             self._write_log(payload)
         elif kind == "device":
-            self._upsert_device(payload)
+            self._accept_polled(payload)
         elif kind == "status":
             iid, text, failed = payload
             self._set_status(iid, text, failed)
@@ -611,19 +638,27 @@ class ScannerApp:
 
     def _default_width(self, column: str) -> int:
         font = tkfont.nametofont("TkDefaultFont")
+        if column == "fav":
+            return font.measure(FAV_MARK) + 20
         return max(font.measure("0" * DEFAULT_CHARS[column]), font.measure(HEADINGS[column]) + 30) + 22
 
     def _row_values(self, dev: Device) -> tuple:
         row = dev.as_row()
-        return tuple(WINBOX_LABEL if c == "winbox" else row[c] for c in TREE_COLUMNS)
+        row.update(winbox=WINBOX_LABEL, fav=FAV_MARK if dev.favorite else "",
+                   signal=health.signal_text(dev.radio))
+        return tuple(row[c] for c in TREE_COLUMNS)
 
     def _row_image(self, iid: str):
         return self._icons[("row", iid in self.checked)]
 
     def _row_tags(self, dev: Device) -> tuple:
-        """One colour tag per row: red for a failed device, else by age of the last backup."""
+        """One colour tag per row: red for a failed device, purple for unsaved changes,
+        blue for port problems, light blue for weak radio, else by age of the last backup."""
         if dev.failed:
             return ("error",)
+        for tag, flag in (("changed", dev.changes), ("port", dev.port_problem), ("radio", dev.radio_problem)):
+            if flag:
+                return (tag,)
         tag = core.backup_age_tag(dev.last_backup)
         return (tag,) if tag else ()
 
@@ -657,6 +692,14 @@ class ScannerApp:
         if self.var_errors_only.get() and not dev.failed:
             return False
         if self.var_no_backup.get() and dev.last_backup:
+            return False
+        if self.var_changed_only.get() and not dev.changes:
+            return False
+        if self.var_port_issue.get() and not dev.port_problem:
+            return False
+        if self.var_weak_radio.get() and not dev.radio_problem:
+            return False
+        if self.var_favorites.get() and not dev.favorite:
             return False
         months = self._age_months()
         if months and not core.backup_older_than(dev.last_backup, months):
@@ -713,7 +756,12 @@ class ScannerApp:
         self._counts_dirty = True
 
     def _on_filter_change(self) -> None:
+        self._show_signal_column(self.var_weak_radio.get())
         self._relayout()
+
+    def _show_signal_column(self, show: bool) -> None:
+        """The «Сигнал» column is there only while «Слабое радио» is ticked."""
+        self.tree.configure(displaycolumns=[c for c in TREE_COLUMNS if show or c != "signal"])
 
     def _on_search_changed(self) -> None:
         """Typing in the search box filters the table (after a short pause)."""
@@ -732,6 +780,9 @@ class ScannerApp:
         self._models_sel.clear()
         self.var_errors_only.set(False)
         self.var_no_backup.set(False)
+        for var in (self.var_changed_only, self.var_port_issue, self.var_weak_radio, self.var_favorites):
+            var.set(False)
+        self._show_signal_column(False)
         self.var_age.set(AGE_CHOICES[0][0])
         self.var_find.set("")
         self._search_words = []
@@ -858,9 +909,14 @@ class ScannerApp:
         stale = [i for i, d in self.devices.items() if d.ip == dev.ip and i != iid]
         # a rescan builds a fresh Device that knows nothing about backups or notes
         previous = [p for p in [self.devices.get(iid)] + [self.devices[i] for i in stale] if p]
-        for attr in ("last_backup", "note"):
+        for attr in ("last_backup", "note", "favorite"):
             if not getattr(dev, attr):
-                setattr(dev, attr, next((getattr(p, attr) for p in previous if getattr(p, attr)), ""))
+                setattr(dev, attr, next((getattr(p, attr) for p in previous if getattr(p, attr)),
+                                        getattr(dev, attr)))
+        if previous and not dev.extended:
+            # a CSV row knows nothing about ports, radio or changes: keep what the table had
+            for attr in HEALTH_FIELDS:
+                setattr(dev, attr, copy.deepcopy(getattr(previous[0], attr)))
         for other in stale:
             if other in self.checked:
                 self.checked.discard(other)
@@ -878,6 +934,21 @@ class ScannerApp:
         self.devices[iid] = dev
         self._apply_visibility(iid)
         self._counts_dirty = self._models_dirty = True
+
+    def _accept_polled(self, dev: Device) -> None:
+        """A device just read by a scan / update: compare it with how it was before
+        this scan (ports, radio, changes — see health.analyse), then show it.
+        A router reached through several addresses arrives several times; each
+        arrival is compared with the same state from before the scan."""
+        iid = dev.key or dev.ip
+        if iid not in self._baselines:
+            before = self.devices.get(iid) or next(
+                (d for d in self.devices.values() if dev.ip in (d.ip, d.reach_ip)), None)
+            self._baselines[iid] = copy.deepcopy(before)
+        health.analyse(dev, self._baselines[iid])
+        if dev.changes or dev.port_problem or dev.radio_problem:
+            self._write_log(f"{dev.ip} ({dev.identity}): {dev.status}")   # the full text; the cell may be cut
+        self._upsert_device(dev)
 
     # --------------------------------------------------------- table logic
     def _on_tree_click(self, event) -> None:
@@ -900,8 +971,10 @@ class ScannerApp:
                 self._toggle_check(iid, shift=bool(event.state & 0x1))
             elif rel < self._icon_w + 10:
                 self.on_update_one(iid)
-        elif col == self._winbox_col:
+        elif self._shown_column(col) == "winbox":
             self.on_winbox(iid)
+        elif self._shown_column(col) == "fav":
+            self._set_favorite([iid], not self.devices[iid].favorite)
 
     def _set_checked(self, iid: str, state: bool) -> None:
         if state:
@@ -933,12 +1006,17 @@ class ScannerApp:
     def _column_name(self, column_id: str):
         """Data column key for a '#N' id from identify_column; None for the
         checkbox / update column and for the Winbox button."""
-        if column_id == "#0":
+        name = self._shown_column(column_id)
+        return name if name not in ("fav", "winbox") else None
+
+    def _shown_column(self, column_id: str):
+        """Column key for a '#N' id (counted among the columns shown; «Сигнал» may be hidden)."""
+        if not column_id.startswith("#") or column_id == "#0":
             return None
         index = int(column_id[1:]) - 1
-        if 0 <= index < len(TREE_COLUMNS) and TREE_COLUMNS[index] != "winbox":
-            return TREE_COLUMNS[index]
-        return None
+        columns = self.tree.cget("displaycolumns")
+        columns = TREE_COLUMNS if columns in ("#all", ("#all",)) else tuple(columns)
+        return columns[index] if 0 <= index < len(columns) else None
 
     def _on_tree_double_click(self, event) -> None:
         # Tk delivers the 2nd click of a fast pair ONLY to this binding, not to
@@ -1060,6 +1138,9 @@ class ScannerApp:
         menu.add_command(label="Копировать строку", command=lambda: self._copy_text(row_text))
         menu.add_separator()
         menu.add_command(label="Изменить заметку…", command=lambda: self._edit_note(iid))
+        favorite = self.devices[iid].favorite
+        menu.add_command(label="Убрать из избранного" if favorite else "Добавить в избранное",
+                         command=lambda: self._set_favorite([iid], not favorite))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1140,6 +1221,7 @@ class ScannerApp:
             return
         cfg = self._read_config()
         self.tree.set(iid, "Status", "Обновление…")
+        self._baselines = {}
 
         def work():
             ip = dev.reach_ip
@@ -1155,6 +1237,28 @@ class ScannerApp:
             self.ui_queue.put(("save_devices", None))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def on_favorite(self) -> None:
+        """«★ Избранное»: add the ticked rows that are shown to the favourites,
+        or take them out if they all are favourites already."""
+        iids = self.selected_iids()
+        if not iids:
+            messagebox.showinfo("Избранное", "Отметьте галочками устройства, которые нужно добавить "
+                                             "в избранное (или убрать из него).")
+            return
+        self._set_favorite(iids, not all(self.devices[i].favorite for i in iids))
+
+    def _set_favorite(self, iids: list, state: bool) -> None:
+        for iid in iids:
+            dev = self.devices.get(iid)
+            if dev is None:
+                continue
+            dev.favorite = state
+            if self.tree.exists(iid):
+                self.tree.set(iid, "fav", FAV_MARK if state else "")
+            self._apply_visibility(iid)
+        self._save_devices()
+        self.log(f"{'Добавлено в избранное' if state else 'Убрано из избранного'}: {len(iids)}")
 
     def toggle_all(self) -> None:
         """Header checkbox: tick every visible row, or clear them if all are ticked."""
@@ -1464,6 +1568,7 @@ class ScannerApp:
         alternatives = alternatives or {}
         self._maybe_save_settings()
         cfg = self._read_config()
+        self._baselines = {}
         found: list[Device] = []
         # only addresses of devices already in the table need a red status when they fail
         known = {a for d in self.devices.values() for a in (d.ip, d.reach_ip)}
@@ -1627,10 +1732,13 @@ class ScannerApp:
                     text = self._ssh_export(dev, cfg)
             fname = backup_filename(dev.ip, dev.identity)
             path = os.path.join(BACKUP_DIR, fname)
+            moved = core.archive_backups(BACKUP_DIR, dev.ip)   # the previous ones go to Backups/Old
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
             dev.last_backup = datetime.now().strftime(TIME_FORMAT)
-            self.log(f"{dev.ip}: бэкап сохранён -> Backups/{fname}")
+            dev.changes = ""   # the backup has saved them: the device is no longer «changed»
+            self.log(f"{dev.ip}: бэкап сохранён -> Backups/{fname}"
+                     + (f"; прежних бэкапов перенесено в Backups/Old: {len(moved)}" if moved else ""))
             self.ui_queue.put(("status", (iid, f"Бэкап: {fname}", False)))
             self.ui_queue.put(("row", iid))  # shows the new Last Backup time
             return True
@@ -1673,24 +1781,32 @@ class ScannerApp:
             return
         hidden_ticked = sum(1 for i in self.checked if i in self._hidden and i in self.devices)
         text = (f"Удалить из таблицы отмеченные устройства: {len(iids)}?\n\n"
-                "Удаляются только строки таблицы и их запись в сохранённом списке. "
-                "Сами устройства и файлы бэкапов не затрагиваются.\n"
+                "Удаляются строки таблицы и их запись в сохранённом списке, "
+                "а бэкапы этих устройств переносятся в папку Backups/Old. "
+                "Сами устройства не затрагиваются.\n"
                 "Вернуть строки можно новым сканом или импортом CSV.")
         if hidden_ticked:
             text += f"\n\nОтмеченные, но скрытые фильтром устройства ({hidden_ticked}) не затрагиваются."
         if not messagebox.askyesno("Удалить", text, icon="warning", default="no"):
             return
+        archived = 0
         for iid in iids:
             if self.tree.exists(iid):
                 self.tree.delete(iid)
-            self.devices.pop(iid, None)
+            dev = self.devices.pop(iid, None)
+            if dev is not None and dev.ip:
+                try:
+                    archived += len(core.archive_backups(BACKUP_DIR, dev.ip))
+                except OSError as exc:
+                    self.log(f"{dev.ip}: не удалось перенести бэкапы в Backups/Old: {exc}")
             self.checked.discard(iid)
             self._hidden.discard(iid)
         self._anchor = None
         self._sync_header()
         self._counts_dirty = self._models_dirty = True
         self._save_devices()
-        self.log(f"Удалено из таблицы устройств: {len(iids)}.")
+        self.log(f"Удалено из таблицы устройств: {len(iids)}."
+                 + (f" Бэкапов перенесено в Backups/Old: {archived}." if archived else ""))
 
     # ---------------------------------------------------------- import/exp
     def on_export(self) -> None:

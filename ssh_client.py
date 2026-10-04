@@ -334,6 +334,85 @@ _INVENTORY_SCRIPT = "; ".join(
     '[/ip address get $id address] . "|" . [/ip address get $id interface]) } } on-error={}'
 
 
+
+def _rsc_string(code: str) -> str:
+    """A RouterOS string literal holding `code` ($ would be expanded, so it is escaped too)."""
+    return '"' + code.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def _isolated(code: str) -> str:
+    """Run `code` so that even a syntax error in it (a menu missing on this device,
+    e.g. no wireless package, or an argument this RouterOS does not know) only
+    skips this part: RouterOS checks a whole script before running it."""
+    return ":do { [[:parse " + _rsc_string(code) + "]] } on-error={}"
+
+
+def _health_script() -> str:
+    from health import SSH_ERROR_COUNTERS
+    counters = ";".join(f'"{c}"' for c in SSH_ERROR_COUNTERS)
+    parts = [
+        ':foreach i in=[/interface ethernet find] do={:put ("__MTSCAN__eth=" . '
+        '[/interface ethernet get $i name] . "|" . [/interface ethernet get $i running])}',
+        ':foreach i in=[/interface find where type="ether"] do={:do {:put ("__MTSCAN__ld=" . '
+        '[/interface get $i name] . "|" . [/interface get $i link-downs])} on-error={}}',
+        ':foreach i in=[/interface ethernet find where running] do={:do {'
+        ':local m [/interface ethernet monitor $i once as-value]; :put ("__MTSCAN__mon=" . '
+        '[/interface ethernet get $i name] . "|" . ($m->"rate") . "|" . ($m->"full-duplex"))} on-error={}}',
+        ':foreach s in=[/interface ethernet print stats as-value] do={:foreach c in={' + counters + '} do={'
+        ':local v ($s->$c); :if ([:len $v] > 0) do={:put ("__MTSCAN__err=" . ($s->"name") . "|" . $c . "|" . $v)}}}',
+        ':foreach i in=[/interface find where type="ether"] do={:foreach c in={"rx-error";"tx-error";"rx-drop";"tx-drop"} do={'
+        ':do {:put ("__MTSCAN__err=" . [/interface get $i name] . "|" . $c . "|" . [/interface get $i $c])} on-error={}}}',
+        ':foreach i in=[/interface wireless find] do={:put ("__MTSCAN__wlan=" . [/interface wireless get $i name] . "|" . '
+        '[/interface wireless get $i disabled] . "|" . [/interface wireless get $i running] . "|" . '
+        '[/interface wireless get $i radio-name] . "|" . [/interface wireless get $i ssid])}',
+        ':foreach i in=[/interface wireless registration-table find] do={:local tx ""; '
+        ':do {:set tx [/interface wireless registration-table get $i tx-signal-strength]} on-error={}; '
+        ':put ("__MTSCAN__reg=" . [/interface wireless registration-table get $i interface] . "|" . '
+        '[/interface wireless registration-table get $i mac-address] . "|" . '
+        '[/interface wireless registration-table get $i signal-strength] . "|" . $tx)}',
+    ]
+    return "; ".join(_isolated(code) for code in parts) + '; :put "__MTSCAN__health=1"'
+
+
+def parse_health(lines: List[str], dev) -> None:
+    """Fill dev.ports / wireless / radio from the __MTSCAN__ lines of _health_script."""
+    import health
+    ports: Dict[str, Dict] = {}
+    done = False
+
+    def port(name: str) -> Dict:
+        return ports.setdefault(name, {"name": name, "running": False, "rate": "", "full_duplex": "",
+                                       "link_downs": None, "errors": {}})
+    for line in lines:
+        if not line.startswith("__MTSCAN__"):
+            continue
+        key, sep, value = line[len("__MTSCAN__"):].partition("=")
+        if not sep:
+            continue
+        fields = value.split("|")
+        if key == "eth" and len(fields) >= 2:
+            port(fields[0])["running"] = fields[1].strip() == "true"
+        elif key == "ld" and len(fields) >= 2 and fields[0] in ports:
+            ports[fields[0]]["link_downs"] = health.to_int(fields[1])
+        elif key == "mon" and len(fields) >= 3 and fields[0] in ports:
+            ports[fields[0]]["rate"], ports[fields[0]]["full_duplex"] = fields[1].strip(), fields[2].strip()
+        elif key == "err" and len(fields) >= 3 and fields[0] in ports:
+            number = health.to_int(fields[2])
+            if number and health.is_error_counter(fields[1]):
+                ports[fields[0]]["errors"].setdefault(fields[1], number)
+        elif key == "wlan" and len(fields) >= 5:
+            dev.wireless.append({"name": fields[0], "disabled": fields[1] == "true",
+                                 "running": fields[2] == "true", "radio_name": fields[3],
+                                 "ssid": "|".join(fields[4:])})
+        elif key == "reg" and len(fields) >= 4:
+            dev.radio.append({"interface": fields[0], "mac": fields[1],
+                              "rx": health.parse_signal(fields[2]), "tx": health.parse_signal(fields[3])})
+        elif key == "health":
+            done = True
+    dev.ports = list(ports.values())
+    dev.extended = done
+
+
 def _snippet(text: str, limit: int = 160) -> str:
     """The router's own reply, shortened to one line, for an error message."""
     line = " | ".join(part.strip() for part in text.splitlines() if part.strip())
@@ -345,7 +424,7 @@ def scan_host_ssh(host: str, username: str, password: str, port: int = 22,
     """Read RouterOS inventory in one SSH session without changing the router."""
     from core import Device
 
-    output = run_ssh_command(host, username, password, _INVENTORY_SCRIPT,
+    output = run_ssh_command(host, username, password, _INVENTORY_SCRIPT + "; " + _health_script(),
                              port=port, timeout=timeout, retries=retries)
     if logger is not None:
         logger.debug("%s: SSH inventory reply: %r", host, output[:2000])
@@ -366,7 +445,7 @@ def scan_host_ssh(host: str, username: str, password: str, port: int = 22,
         ip=host, connect_ip=host, identity=fields.get("identity", ""),
         board_name=fields.get("board_name") or fields.get("model", ""),
         routeros=fields.get("routeros", ""),
-        key=fields.get("serial") or fields.get("software_id", ""),
+        key=fields.get("serial") or fields.get("software_id", ""), serial=fields.get("serial", ""),
         license=fields.get("license") or fields.get("level", ""),
         addresses=addresses, status=f"OK (SSH:{port})",
     )
@@ -378,4 +457,5 @@ def scan_host_ssh(host: str, username: str, password: str, port: int = 22,
             "SSH: не удалось прочитать данные RouterOS — "
             + (f"ответ устройства: «{reply}»" if reply else "устройство ничего не ответило")
             + " (нужны права read у пользователя; если это не RouterOS — устройство пропускается)")
+    parse_health(output.splitlines(), dev)
     return dev
