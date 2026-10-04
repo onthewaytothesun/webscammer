@@ -61,6 +61,7 @@ class Device:
     favorite: bool = False
     confirmed: List[str] = field(default_factory=list)   # problem kinds accepted with «Подтвердить»
     main_ip: str = ""   # chosen by the operator: shown in the table and tried first
+    router_id: str = "" # OSPF router-id set on the device ('' when none / 0.0.0.0)
     ping: str = ""      # ping to the device at the last interaction ("12 мс" / "нет ответа")
 
     @property
@@ -172,10 +173,11 @@ def address_entries(addresses: List[Dict]) -> List[Dict]:
 
       own      a static address of the router (10.20.58.33/28 -> 10.20.58.33)
       dynamic  an address the router got dynamically (DHCP client etc.)
-      client   an address handed to a client: on a /32 interface address the
-               remote end is in «network» (address=45.87.140.1 network=45.87.140.114
+      client   an address handed to a client: on a static /32 interface address
+               the remote end is in «network» (address=45.87.140.1 network=45.87.140.114
                -> 45.87.140.114). The /32 address itself (45.87.140.1) is the same
-               on many routers and is not listed.
+               on many routers and is not listed. A dynamic /32 address is the
+               router's own (kind dynamic, its «address» is used).
 
     Old caches have no «network» / «dynamic»; their addresses count as own."""
     entries: List[Dict] = []
@@ -186,10 +188,10 @@ def address_entries(addresses: List[Dict]) -> List[Dict]:
         if not ip:
             continue
         network = a.get("network", "")
-        if prefix == "32" and network and network != ip:
-            kind, ip = "client", network
-        elif a.get("dynamic"):
+        if a.get("dynamic"):
             kind = "dynamic"
+        elif prefix == "32" and network and network != ip:
+            kind, ip = "client", network
         else:
             kind = "own"
         if (ip, kind) in seen:
@@ -206,14 +208,19 @@ def all_ips(dev: Device) -> List[str]:
     return list(dict.fromkeys(ip for ip in ips if ip))
 
 
+MGMT_NETWORK = ipaddress.ip_network("10.20.0.0/16")  # dynamic addresses are used only inside it
+
+
 def connect_candidates(dev: Device) -> List[str]:
     """Addresses to connect to, in order: the chosen main IP, the one the scan reached,
-    the table IP, then the other own static addresses, then dynamic ones. Client
-    addresses and /32 addresses are never used (that would hit the clients)."""
+    the table IP, then the other own static addresses, then dynamic ones. Never used:
+    client addresses and the static /32 addresses they hang on (that would hit the
+    clients), and dynamic addresses outside MGMT_NETWORK (the main IP the operator
+    chose is always tried)."""
     entries = address_entries(dev.addresses)
     never = {e["ip"] for e in entries if e["kind"] == "client"} | {
-        a.get("address", "").split("/")[0] for a in dev.addresses
-        if a.get("address", "").endswith("/32") and a.get("network") not in ("", a.get("address", "").split("/")[0])}
+        e["address"].split("/")[0] for e in entries if e["kind"] == "client"} | {
+        e["ip"] for e in entries if e["kind"] == "dynamic" and not ip_in_subnet(e["ip"], MGMT_NETWORK)}
     order: List[str] = []
     usable = ([dev.main_ip, dev.connect_ip, dev.ip]
               + [e["ip"] for e in entries if e["kind"] == "own" and not e["disabled"]]
@@ -222,6 +229,40 @@ def connect_candidates(dev: Device) -> List[str]:
         if ip and ip not in order and (ip not in never or ip == dev.main_ip):
             order.append(ip)
     return order
+
+
+def router_id_ip(dev: Device) -> Optional[str]:
+    """The OSPF router-id when it is one of the device's own addresses."""
+    if not dev.router_id:
+        return None
+    for e in address_entries(dev.addresses):
+        if e["ip"] == dev.router_id and e["kind"] != "client":
+            return e["ip"]
+    return None
+
+
+def auto_ip(dev: Device) -> Optional[str]:
+    """The address shown when the operator has not chosen one: the OSPF router-id
+    address, else the bridge1 address."""
+    return router_id_ip(dev) or bridge_ip(dev.addresses)
+
+
+def pick_router_id(instances: List[Dict[str, str]], ids: List[Dict[str, str]]) -> str:
+    """OSPF router-id from /routing ospf instance rows (RouterOS 6: an address,
+    0.0.0.0 = automatic; RouterOS 7: an address or the name of a /routing id entry)
+    and /routing id rows (RouterOS 7: name, id). '' when none is set."""
+    by_name = {r.get("name", ""): r.get("id", "") for r in ids}
+    for inst in instances:
+        if inst.get("disabled") == "true":
+            continue
+        value = inst.get("router-id", "")
+        value = by_name.get(value, value)
+        try:
+            if value and ipaddress.ip_address(value) != ipaddress.ip_address("0.0.0.0"):
+                return value
+        except ValueError:
+            continue
+    return ""
 
 
 def is_unreachable(exc: BaseException) -> bool:
@@ -305,7 +346,8 @@ def dedupe_devices(devices: List[Device]) -> List[Device]:
         chosen = group[0]
         # any member that managed to read the address list will do
         addresses = next((m.addresses for m in group if m.addresses), [])
-        preferred = bridge_ip(addresses)
+        router_id = next((m.router_id for m in group if m.router_id), "")
+        preferred = auto_ip(Device(addresses=addresses, router_id=router_id))
         if preferred:
             # Prefer the group member whose scanned IP is the bridge1 IP.
             for member in group:
@@ -452,6 +494,9 @@ def _collect_health(api: RouterOSApi, dev: Device) -> None:
          "tx": health.parse_signal(r.get("tx-signal-strength", ""))}
         for r in _talk_or_empty(api, ["/interface/wireless/registration-table/print"])
     ]
+    dev.router_id = pick_router_id(
+        _talk_or_empty(api, ["/routing/ospf/instance/print"]),
+        _talk_or_empty(api, ["/routing/id/print"]))
     dev.extended = True
 
 

@@ -58,7 +58,7 @@ def test_gui_builds_with_all_row_actions():
         assert list(M.DATA_COLUMNS).index("Last Backup") == list(M.DATA_COLUMNS).index("Last seen") + 1
         shown = [app.tree.heading(c, "text") for c in columns]
         assert shown == ["★", "IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
-                         "Последний бэкап", "Статус", "Сигнал", "Ping", "Winbox", "Заметка"], shown
+                         "Последний бэкап", "Статус", "Сигнал", "Ping", "Router-ID", "Winbox", "Заметка"], shown
         assert "signal" not in app.tree.cget("displaycolumns")   # only with «Слабое радио»
         assert "ping" not in app.tree.cget("displaycolumns")     # only with «Ping»
     finally:
@@ -970,7 +970,7 @@ def test_gui_everything_the_user_sees_is_in_russian():
         texts += [app.tree.heading(c, "text") for c in app.tree.cget("columns")]
         texts += [app.notebook.tab(i, "text") for i in range(app.notebook.index("end"))]
         kept = {"IP", "Identity", "RouterOS", "License", "Winbox", "SSH:", "API-SSL:", "Winbox:", "SSH", "API/SSL",
-                "CSV", "▶ Winbox", "Ping"}
+                "CSV", "▶ Winbox", "Ping", "Router-ID"}
         english = [t for t in texts if re.search(r"[A-Za-z]{3,}", t) and t not in kept
                    and not t.startswith(("SSH:", "API/SSL:", "Порт API-SSL:", "Лог: logs/"))]
         assert english == [], english
@@ -1334,3 +1334,52 @@ def test_gui_all_ips_main_ip_subnet_search_and_ping():
     finally:
         core.ping = real_ping
         app._on_close()
+
+
+def test_gui_router_id_column_current_row_frame_and_moving_columns():
+    M, tk, root, app = _open()
+    from core import Device
+    try:
+        addrs = [{"address": "10.20.58.33/28", "interface": "bridge1", "network": "10.20.58.32"},
+                 {"address": "10.20.255.7/32", "interface": "lo", "network": "10.20.255.7"}]
+        app._upsert_device(Device(ip="10.20.58.33", identity="R1", key="S1", addresses=addrs,
+                                  router_id="10.20.255.7"))
+        app._upsert_device(Device(ip="10.30.0.1", identity="R2", key="S2"))
+        assert "router_id" not in app.tree.cget("displaycolumns")
+        app.var_router_id_show.set(True); app._on_filter_change()
+        assert "router_id" in app.tree.cget("displaycolumns") and app.tree.set("S1", "router_id") == "10.20.255.7"
+        app._set_main_ip("S1", "")                        # automatic: the router-id address wins over bridge1
+        assert app.tree.set("S1", "IP") == "10.20.255.7"
+
+        _pump(root, 3)
+        app._set_current_row("S2")
+        _pump(root, 3)
+        box = app.tree.bbox("S2")
+        assert box and app._row_frame[0].winfo_ismapped() and app._row_frame[0].winfo_y() == box[1]
+        app._set_current_row("S1")
+        _pump(root, 3)
+        assert app._row_frame[0].winfo_y() == app.tree.bbox("S1")[1]
+
+        app._move_column("Note", "IP")                    # dragged left: lands before IP
+        shown = list(app.tree.cget("displaycolumns"))
+        assert shown.index("Note") == shown.index("IP") - 1
+        app._move_column("fav", "Identity")               # dragged right: lands after Identity
+        shown = list(app.tree.cget("displaycolumns"))
+        assert shown.index("fav") == shown.index("Identity") + 1
+        assert app._column_name("#%d" % (shown.index("Identity") + 1)) == "Identity"
+    finally:
+        app._on_close()
+
+
+def test_gui_column_order_is_remembered():
+    M, tk, root, app = _open()
+    app._move_column("Note", "IP")
+    order = list(app._column_order)
+    app._on_close()
+    app2 = M.ScannerApp(tk.Tk())
+    try:
+        assert app2._column_order == order
+        app2._reset_column_order()
+        assert app2._column_order == list(M.TREE_COLUMNS)
+    finally:
+        app2._on_close()

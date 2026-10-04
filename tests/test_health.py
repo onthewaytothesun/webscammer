@@ -136,7 +136,7 @@ def test_api_without_wireless_package_is_fine():
 
 def test_ssh_health_script_is_isolated_and_its_reply_parsed():
     script = ssh_client._health_script()
-    assert script.count("[[:parse ") == 8 and script.endswith(':put "__MTSCAN__health=1"')
+    assert script.count("[[:parse ") == 10 and script.endswith(':put "__MTSCAN__health=1"')
     assert ssh_client._rsc_string('a "b" $x \\ y') == '"a \\"b\\" \\$x \\\\ y"'
     reply = """__MTSCAN__eth=ether1|true
 __MTSCAN__eth=ether2|false
@@ -218,8 +218,10 @@ def test_address_kinds_own_client_network_and_dynamic():
 
 
 def test_connections_never_go_to_client_addresses():
-    dev = Device(ip="10.20.58.33", connect_ip="10.20.24.132", addresses=ADDRS)
-    assert core.connect_candidates(dev) == ["10.20.24.132", "10.20.58.33", "10.255.0.1", "192.168.88.10"]
+    dev = Device(ip="10.20.58.33", connect_ip="10.20.24.132", addresses=ADDRS + [
+        {"address": "10.20.99.5/24", "interface": "ether2", "network": "10.20.99.0", "dynamic": True}])
+    # dynamic addresses only inside 10.20.0.0/16: 192.168.88.10 is never used
+    assert core.connect_candidates(dev) == ["10.20.24.132", "10.20.58.33", "10.255.0.1", "10.20.99.5"]
     dev.main_ip = "10.255.0.1"
     assert core.connect_candidates(dev)[0] == "10.255.0.1"
     assert "45.87.140.114" in core.all_ips(dev) and "45.87.140.1" not in core.all_ips(dev)
@@ -259,3 +261,33 @@ def test_ping_reads_linux_and_windows_output_in_any_language():
         subprocess.run = real
     assert core.ping_text(None) == "нет ответа" and core.ping_text(0.4) == "<1 мс" and core.ping_text(14) == "14 мс"
     assert core.parse_subnet("10.20.30.0/24") and core.parse_subnet("10.20.30.1") is None
+
+
+def test_a_dynamic_32_address_is_the_routers_own_not_a_client():
+    addrs = [{"address": "100.64.1.5/32", "interface": "pppoe-out1", "network": "100.64.0.1", "dynamic": True},
+             {"address": "10.20.7.9/32", "interface": "pppoe-out2", "network": "10.20.0.1", "dynamic": True}]
+    entries = core.address_entries(addrs)
+    assert [(e["ip"], e["kind"]) for e in entries] == [("100.64.1.5", "dynamic"), ("10.20.7.9", "dynamic")]
+    dev = Device(ip="10.20.1.1", addresses=addrs)
+    assert core.connect_candidates(dev) == ["10.20.1.1", "10.20.7.9"]
+    assert "100.64.0.1" not in core.all_ips(dev) and "100.64.1.5" in core.all_ips(dev)
+
+
+def test_router_id_from_ospf_routeros_6_and_7():
+    assert core.pick_router_id([{"router-id": "0.0.0.0"}], []) == ""
+    assert core.pick_router_id([{"router-id": "10.20.255.7"}], []) == "10.20.255.7"
+    assert core.pick_router_id([{"router-id": "10.1.1.1", "disabled": "true"}], []) == ""
+    assert core.pick_router_id([{"router-id": "main"}], [{"name": "main", "id": "10.20.255.9"}]) == "10.20.255.9"
+    assert core.pick_router_id([{"router-id": "main"}], [{"name": "main", "id": ""}]) == ""
+    dev = Device(addresses=[{"address": "10.20.58.33/28", "interface": "bridge1", "network": "10.20.58.32"},
+                            {"address": "10.20.255.7/32", "interface": "lo", "network": "10.20.255.7"}],
+                 router_id="10.20.255.7")
+    assert core.auto_ip(dev) == "10.20.255.7"
+    dev.router_id = "10.99.99.99"                        # not an address of this device: bridge1
+    assert core.auto_ip(dev) == "10.20.58.33"
+    rows = [Device(ip="10.20.58.33", key="K", addresses=dev.addresses, router_id="10.20.255.7")]
+    assert core.dedupe_devices(rows)[0].ip == "10.20.255.7"
+    reply = ["__MTSCAN__ospf=main|false", "__MTSCAN__rtid=main|10.20.255.7", "__MTSCAN__health=1"]
+    parsed = Device()
+    ssh_client.parse_health(reply, parsed)
+    assert parsed.router_id == "10.20.255.7"

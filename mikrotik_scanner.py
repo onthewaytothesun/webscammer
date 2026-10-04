@@ -62,13 +62,14 @@ DATA_COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last see
                 "Last Backup", "Status", "Note")
 # left to right in the table: the favourite star, the data, the signal levels (shown
 # only while the «Слабое радио» filter is on), the Winbox button and the note
-TREE_COLUMNS = ("fav",) + DATA_COLUMNS[:-1] + ("signal", "ping", "winbox", "Note")
-EXTRA_COLUMNS = ("fav", "signal", "ping", "winbox")   # not data: not sorted or exported
+TREE_COLUMNS = ("fav",) + DATA_COLUMNS[:-1] + ("signal", "ping", "router_id", "winbox", "Note")
+EXTRA_COLUMNS = ("fav", "signal", "ping", "router_id", "winbox")   # not data: not sorted or exported
+OPTIONAL_COLUMNS = ("signal", "ping", "router_id")   # shown only when their checkbox is ticked
 HEADINGS = {
     "IP": "IP", "Identity": "Identity", "Board Name": "Модель", "RouterOS": "RouterOS",
     "License": "License", "Last seen": "Был в сети", "Last Backup": "Последний бэкап",
     "Status": "Статус", "winbox": "Winbox", "Note": "Заметка", "fav": "★", "signal": "Сигнал",
-    "ping": "Ping",
+    "ping": "Ping", "router_id": "Router-ID",
 }
 HEALTH_FIELDS = ("serial", "ports", "wireless", "radio", "extended",
                  "port_problem", "radio_problem", "changes")
@@ -79,7 +80,7 @@ CSV_ALIASES = {**{v: k for k, v in HEADINGS.items()}, **{k: k for k in DATA_COLU
 # default column widths, in characters of the current font (so they fit any font/DPI)
 DEFAULT_CHARS = {"IP": 14, "Identity": 18, "Board Name": 13, "RouterOS": 10, "License": 7,
                  "Last seen": 19, "Last Backup": 19, "Status": 18, "winbox": 8, "Note": 26,
-                 "fav": 1, "signal": 24, "ping": 9}
+                 "fav": 1, "signal": 24, "ping": 9, "router_id": 14}
 TIME_FORMAT = core.TIME_FORMAT
 WINBOX_LABEL = "▶ Winbox"  # per-row launcher
 MAX_OPS_THREADS = 10  # Backup / SEND run this many devices at once at most
@@ -91,6 +92,7 @@ AGE_COLORS = {"age3": "#fff1a0", "age6": "#ffc27d", "age12": "#ff8f8f"}
 # changed since the previous update (until a backup saves it) / port problems / weak radio
 STATE_COLORS = {"changed": "#d9b8f5", "port": "#8db4f0", "radio": "#c4ecff"}
 FAV_MARK = "★"
+ROW_FRAME_COLOR = "#1a4fd6"   # the frame around the row last worked with
 AGE_CHOICES = (("Любой возраст", 0), ("Старше 3 мес.", 3), ("Старше 6 мес.", 6), ("Старше 12 мес.", 12))
 COMMAND_HINTS = {
     "SSH": "SSH: команды как в терминале RouterOS, например /ip service set ssh port=22",
@@ -155,6 +157,11 @@ class ScannerApp:
         self.var_signal_show = BooleanVar(value=False)
         self.var_signal_limit = StringVar()
         self.var_ping_show = BooleanVar(value=False)
+        self.var_router_id_show = BooleanVar(value=False)
+        self._column_order = list(TREE_COLUMNS)   # the operator can drag columns around
+        self._drag_column = None
+        self._current_row = None                  # the row last clicked: drawn with a frame
+        self._row_frame_box = None
         self._search_nets: list = []   # subnets typed in the search box (10.20.30.0/24)
         self._signal_limit = None   # the parsed «не лучше» value, dBm
         self._baselines: dict = {}   # iid -> the device as it was before the running scan / update
@@ -406,6 +413,8 @@ class ScannerApp:
                   foreground="#666").pack(side=LEFT, padx=(4, 0))
         ttk.Checkbutton(health_row, text="Ping", variable=self.var_ping_show,
                         command=self._on_filter_change).pack(side=LEFT, padx=(24, 0))
+        ttk.Checkbutton(health_row, text="Router-ID", variable=self.var_router_id_show,
+                        command=self._on_filter_change).pack(side=LEFT, padx=(12, 0))
         self.var_signal_limit.trace_add("write", lambda *_: self._on_search_changed())
 
         # table
@@ -437,6 +446,9 @@ class ScannerApp:
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
+        self.tree.bind("<B1-Motion>", self._on_tree_drag)
+        self._row_frame = [tk.Frame(self.tree, bg=ROW_FRAME_COLOR, bd=0, highlightthickness=0)
+                           for _ in range(4)]
         for seq in self._right_click_sequences():
             self.tree.bind(seq, self._on_tree_right_click)
         self._load_ui_state()
@@ -625,6 +637,29 @@ class ScannerApp:
             self._refresh_model_choices()
         if self._counts_dirty:
             self._update_counts()
+        self._place_row_frame()
+
+    # ---- the row last worked with is drawn with a frame until another row is clicked
+    def _set_current_row(self, iid: str) -> None:
+        self._current_row = iid
+        self._place_row_frame()
+
+    def _place_row_frame(self) -> None:
+        iid = self._current_row
+        box = self.tree.bbox(iid) if iid and self.tree.exists(iid) else ""
+        if box == self._row_frame_box:
+            return
+        self._row_frame_box = box
+        if not box:
+            for line in self._row_frame:
+                line.place_forget()
+            return
+        x, y, w, h = box
+        t = 2
+        for line, (lx, ly, lw, lh) in zip(self._row_frame, ((x, y, w, t), (x, y + h - t, w, t),
+                                                            (x, y, t, h), (x + w - t, y, t, h))):
+            line.place(x=lx, y=ly, width=lw, height=lh)
+            line.lift()
 
     def _handle_ui_message(self, kind: str, payload) -> None:
         if kind == "log":
@@ -672,7 +707,7 @@ class ScannerApp:
     def _row_values(self, dev: Device) -> tuple:
         row = dev.as_row()
         row.update(winbox=WINBOX_LABEL, fav=FAV_MARK if dev.favorite else "",
-                   signal=health.signal_text(dev.radio), ping=dev.ping)
+                   signal=health.signal_text(dev.radio), ping=dev.ping, router_id=dev.router_id)
         return tuple(row[c] for c in TREE_COLUMNS)
 
     def _row_image(self, iid: str):
@@ -714,7 +749,7 @@ class ScannerApp:
         """What the search box looks in: the columns, and every IP of the device
         (also the ones not shown: other interfaces, client addresses)."""
         row = dev.as_row()
-        return " ".join([row[c] for c in DATA_COLUMNS] + core.all_ips(dev)).lower()
+        return " ".join([row[c] for c in DATA_COLUMNS] + core.all_ips(dev) + [dev.router_id]).lower()
 
     def _matches_filter(self, dev: Device) -> bool:
         if self._models_sel and self._model_key(dev) not in self._models_sel:
@@ -812,8 +847,10 @@ class ScannerApp:
     def _show_signal_column(self, show: bool) -> None:
         """The «Сигнал» column is there only with «Сигнал», «Слабое радио» or a «не лучше» value;
         «Ping» only with its checkbox."""
-        hidden = ({"signal"} if not show else set()) | ({"ping"} if not self.var_ping_show.get() else set())
-        self.tree.configure(displaycolumns=[c for c in TREE_COLUMNS if c not in hidden])
+        self._signal_shown = show
+        wanted = {"signal": show, "ping": self.var_ping_show.get(), "router_id": self.var_router_id_show.get()}
+        self.tree.configure(displaycolumns=[c for c in self._column_order
+                                            if c not in OPTIONAL_COLUMNS or wanted[c]])
 
     def _on_search_changed(self) -> None:
         """Typing in the search box filters the table (after a short pause)."""
@@ -1027,14 +1064,18 @@ class ScannerApp:
     # --------------------------------------------------------- table logic
     def _on_tree_click(self, event) -> None:
         # remember a column-border drag so its new width is saved on release
-        self._resizing_columns = self.tree.identify_region(event.x, event.y) == "separator"
+        region = self.tree.identify_region(event.x, event.y)
+        self._resizing_columns = region == "separator"
+        # a heading can be dragged onto another one to move the column
+        self._drag_column = self._shown_column(self.tree.identify_column(event.x)) if region == "heading" else None
         if event.state & 0x4:  # Ctrl-click is the right click on macOS
             return
-        if self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
+        if region not in ("tree", "cell"):
             return
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
+        self._set_current_row(iid)
         col = self.tree.identify_column(event.x)
         if col == "#0":
             box = self.tree.bbox(iid, "#0")
@@ -1101,6 +1142,8 @@ class ScannerApp:
         # update or Winbox button would be swallowed).
         if self.tree.identify_region(event.x, event.y) == "cell":
             iid = self.tree.identify_row(event.y)
+            if iid:
+                self._set_current_row(iid)
             name = self._column_name(self.tree.identify_column(event.x)) if iid else None
             if name == "Last Backup":
                 self.open_last_backup(iid)
@@ -1186,10 +1229,40 @@ class ScannerApp:
         self._counts_dirty = True
         self._save_devices()
 
-    def _on_tree_release(self, _event) -> None:
+    def _on_tree_release(self, event) -> None:
         if self._resizing_columns:
             self._resizing_columns = False
             self._save_ui_state()
+        dragged, self._drag_column = self._drag_column, None
+        if dragged is None:
+            return
+        self.tree.configure(cursor="")
+        if self.tree.identify_region(event.x, event.y) not in ("heading", "separator"):
+            return
+        target = self._shown_column(self.tree.identify_column(event.x))
+        if target and target != dragged:
+            self._move_column(dragged, target)
+
+    def _on_tree_drag(self, event) -> None:
+        if self._drag_column is not None:
+            over = self._shown_column(self.tree.identify_column(event.x))
+            self.tree.configure(cursor="sb_h_double_arrow" if over and over != self._drag_column else "")
+
+    def _move_column(self, column: str, target: str) -> None:
+        """Put `column` where `target` is (after it when moving right, before it when moving left)."""
+        order = self._column_order
+        moving_right = order.index(column) < order.index(target)
+        order.remove(column)
+        order.insert(order.index(target) + (1 if moving_right else 0), column)
+        self._show_signal_column(self._signal_shown)
+        self._row_frame_box = None
+        self._save_ui_state()
+
+    def _reset_column_order(self) -> None:
+        self._column_order = list(TREE_COLUMNS)
+        self._show_signal_column(self._signal_shown)
+        self._row_frame_box = None
+        self._save_ui_state()
 
     # ------------------------------------------ copy from the table (right click)
     def _copy_text(self, text: str) -> None:
@@ -1197,11 +1270,22 @@ class ScannerApp:
         self.root.clipboard_append(text)
 
     def _on_tree_right_click(self, event) -> None:
-        if self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
+        region = self.tree.identify_region(event.x, event.y)
+        if region in ("heading", "separator"):
+            menu = tk.Menu(self.tree, tearoff=0)
+            menu.add_command(label="Порядок столбцов по умолчанию", command=self._reset_column_order,
+                             state="normal" if self._column_order != list(TREE_COLUMNS) else "disabled")
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return
+        if region not in ("tree", "cell"):
             return
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
+        self._set_current_row(iid)
         name = self._column_name(self.tree.identify_column(event.x))  # data cells only
         row_text = "\t".join(self.tree.set(iid, c) for c in DATA_COLUMNS)  # tabs paste into Excel columns
         menu = tk.Menu(self.tree, tearoff=0)
@@ -1235,7 +1319,7 @@ class ScannerApp:
         try:
             tmp = UI_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"column_widths": widths}, fh, indent=1)
+                json.dump({"column_widths": widths, "column_order": self._column_order}, fh, indent=1)
             os.replace(tmp, UI_FILE)
         except OSError as exc:
             self.logger.warning("could not save column widths: %s", exc)
@@ -1243,9 +1327,18 @@ class ScannerApp:
     def _load_ui_state(self) -> None:
         try:
             with open(UI_FILE, encoding="utf-8") as fh:
-                widths = json.load(fh).get("column_widths", {})
+                data = json.load(fh)
+            widths = data.get("column_widths", {})
+            saved_order = data.get("column_order", [])
         except (OSError, ValueError, AttributeError):
             return
+        if isinstance(saved_order, list):
+            order = [c for c in dict.fromkeys(saved_order) if c in TREE_COLUMNS]
+            for index, column in enumerate(TREE_COLUMNS):   # columns added in a newer version
+                if column not in order:
+                    order.insert(min(index, len(order)), column)
+            self._column_order = order
+            self._show_signal_column(False)
         known = ("#0",) + tuple(self.tree.cget("columns"))
         for name, width in (widths.items() if isinstance(widths, dict) else []):
             try:
@@ -1332,6 +1425,8 @@ class ScannerApp:
                     "client": f"клиент: network на {entry['address']}, не подключаемся"}[entry["kind"]]
             if entry["disabled"]:
                 kind += ", выключен"
+            if entry["ip"] == dev.router_id and entry["kind"] != "client":
+                kind += ", Router-ID OSPF"
             rows.append((entry["ip"], entry["interface"], kind, entry["kind"] != "client"))
             seen.add(entry["ip"])
         for ip, what in ((dev.connect_ip, "адрес, по которому устройство найдено"), (dev.ip, "адрес в таблице")):
@@ -1347,12 +1442,13 @@ class ScannerApp:
         win = tk.Toplevel(self.root)
         win.title(f"Все IP — {dev.identity or dev.ip}")
         win.transient(self.root)
+        win.minsize(560, 200)
         info = ttk.Label(win, justify="left")
         info.pack(anchor="w", padx=8, pady=(8, 4))
         body = ttk.Frame(win)
         body.pack(fill=BOTH, expand=True, padx=8)
         rows = self._ip_rows(dev)
-        tv = ttk.Treeview(body, columns=("ip", "iface", "kind"), show="headings", selectmode="browse",
+        tv = ttk.Treeview(body, columns=("ip", "iface", "kind"), show="headings", selectmode="extended",
                           height=min(max(len(rows), 4), 16))
         for col, text, width in (("ip", "IP", 130), ("iface", "Интерфейс", 120), ("kind", "Что это", 460)):
             tv.heading(col, text=text)
@@ -1368,12 +1464,33 @@ class ScannerApp:
                 mark = "★ основной · " if ip == dev.ip else ""
                 tv.insert("", END, iid=str(i), values=(ip, iface, mark + kind))
             info.configure(text=f"Основной IP: {dev.ip}" + (" (выбран вручную)" if dev.main_ip else
-                                                              " (автоматически: адрес на bridge1)")
+                                                              " (автоматически: Router-ID OSPF или адрес на bridge1)")
                            + "\nПодключение — через основной, если он не отвечает — через другие свои адреса.")
 
         def chosen():
             sel = tv.selection()
             return self._ip_rows(dev)[int(sel[0])] if sel else None
+
+        def copy(what: str) -> None:
+            rows = self._ip_rows(dev)
+            picked = [rows[int(i)] for i in tv.selection()] or (rows if what == "all" else [])
+            if what == "ips":
+                self._copy_text("\n".join(r[0] for r in picked))
+            else:
+                self._copy_text("\n".join(f"{r[0]}\t{r[1]}\t{r[2]}" for r in picked))
+
+        def popup(event):
+            row = tv.identify_row(event.y)
+            if row and row not in tv.selection():
+                tv.selection_set(row)
+            menu = tk.Menu(tv, tearoff=0)
+            menu.add_command(label="Копировать IP", command=lambda: copy("ips"))
+            menu.add_command(label="Копировать строки", command=lambda: copy("rows"))
+            menu.add_command(label="Копировать все", command=lambda: copy("all"))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
 
         def make_main():
             row = chosen()
@@ -1394,11 +1511,19 @@ class ScannerApp:
         buttons.pack(fill=X, padx=8, pady=8)
         ttk.Button(buttons, text="Сделать основным", command=make_main).pack(side=LEFT)
         ttk.Button(buttons, text="Автоматически", command=automatic).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Копировать все",
-                   command=lambda: self._copy_text("\n".join(f"{r[0]}\t{r[1]}\t{r[2]}"
-                                                             for r in self._ip_rows(dev)))).pack(side=LEFT, padx=4)
+        ttk.Button(buttons, text="Копировать IP", command=lambda: copy("ips")).pack(side=LEFT, padx=4)
+        ttk.Button(buttons, text="Копировать все", command=lambda: copy("all")).pack(side=LEFT, padx=4)
         ttk.Button(buttons, text="Закрыть", command=win.destroy).pack(side=RIGHT)
         tv.bind("<Double-Button-1>", lambda e: make_main())
+        for seq in self._right_click_sequences():
+            tv.bind(seq, popup)
+        for seq in ("<Control-c>", "<Control-C>", "<Command-c>"):
+            try:
+                tv.bind(seq, lambda e: copy("ips"))
+            except tk.TclError:   # <Command-…> exists only on macOS
+                pass
+        ttk.Label(win, text="Выделите строки (Ctrl/Shift+клик) и скопируйте: Ctrl+C — только IP, "
+                            "правый клик — меню.", foreground="#666").pack(anchor="w", padx=8, pady=(0, 6))
         win.bind("<Escape>", lambda e: win.destroy())
         fill()
         self._ips_dialog = win   # for tests
@@ -1411,7 +1536,7 @@ class ScannerApp:
         if not dev.connect_ip:
             dev.connect_ip = dev.ip
         dev.main_ip = ip
-        dev.ip = ip or core.bridge_ip(dev.addresses) or dev.connect_ip or dev.ip
+        dev.ip = ip or core.auto_ip(dev) or dev.connect_ip or dev.ip
         if self.tree.exists(iid):
             self.tree.item(iid, values=self._row_values(dev))
         self._apply_visibility(iid)
@@ -1770,8 +1895,9 @@ class ScannerApp:
             return
         targets, alternatives = [], {}
         for iid in self._visible_iids():
-            hosts = core.connect_candidates(self.devices[iid])
-            if hosts and hosts[0] not in targets:
+            dev = self.devices[iid]
+            hosts = core.connect_candidates(dev) or [dev.reach_ip]
+            if hosts[0] and hosts[0] not in targets:
                 targets.append(hosts[0])
                 alternatives[hosts[0]] = hosts[1:]   # tried when the first one does not answer
         if not targets:

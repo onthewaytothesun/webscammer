@@ -365,6 +365,10 @@ def _health_script() -> str:
         ':foreach i in=[/ip address find] do={:put ("__MTSCAN__addr2=" . [/ip address get $i address] . "|" . '
         '[/ip address get $i interface] . "|" . [/ip address get $i network] . "|" . '
         '[/ip address get $i dynamic] . "|" . [/ip address get $i disabled])}',
+        ':foreach i in=[/routing ospf instance find] do={:put ("__MTSCAN__ospf=" . '
+        '[/routing ospf instance get $i router-id] . "|" . [/routing ospf instance get $i disabled])}',
+        ':foreach i in=[/routing id find] do={:put ("__MTSCAN__rtid=" . [/routing id get $i name] . "|" . '
+        '[/routing id get $i id])}',
         ':foreach i in=[/interface wireless find] do={:put ("__MTSCAN__wlan=" . [/interface wireless get $i name] . "|" . '
         '[/interface wireless get $i disabled] . "|" . [/interface wireless get $i running] . "|" . '
         '[/interface wireless get $i radio-name] . "|" . [/interface wireless get $i ssid])}',
@@ -383,6 +387,8 @@ def parse_health(lines: List[str], dev) -> None:
     ports: Dict[str, Dict] = {}
     link_downs: Dict[str, Optional[int]] = {}
     addresses: List[Dict] = []
+    instances: List[Dict] = []
+    ids: List[Dict] = []
     done = False
 
     def port(name: str) -> Dict:
@@ -415,6 +421,10 @@ def parse_health(lines: List[str], dev) -> None:
         elif key == "addr2" and len(fields) >= 5:
             addresses.append({"address": fields[0], "interface": fields[1], "network": fields[2],
                               "dynamic": fields[3] == "true", "disabled": fields[4] == "true"})
+        elif key == "ospf" and len(fields) >= 2:
+            instances.append({"router-id": fields[0], "disabled": fields[1]})
+        elif key == "rtid" and len(fields) >= 2:
+            ids.append({"name": fields[0], "id": fields[1]})
         elif key == "health":
             done = True
     for name, downs in link_downs.items():
@@ -422,6 +432,8 @@ def parse_health(lines: List[str], dev) -> None:
             ports[name]["link_downs"] = downs
     for wlan in dev.wireless:
         wlan["link_downs"] = link_downs.get(wlan["name"])
+    from core import pick_router_id
+    dev.router_id = pick_router_id(instances, ids)
     if addresses:   # with network / dynamic, which the plain inventory line lacks
         dev.addresses = addresses
     dev.ports = list(ports.values())
