@@ -16,7 +16,7 @@ WEAK_SIGNAL = -75        # dBm: a signal below this (rx or tx) is weak
 SIGNAL_DROP = 10         # dB worse than at the previous update = degraded
 FLAP_LINK_DOWNS = 10     # an ethernet link lost this many times since the previous update = flapping
 WLAN_FLAPS = 10          # a wlan link lost MORE than this many times since the previous update = flapping
-ERROR_LIMIT = 1          # an error counter above this is a problem
+PORT_ERRORS = 10         # an error counter at or above this is a problem
 
 _ERROR_COUNTER = re.compile(
     r"error|fcs|align|fragment|overflow|too-short|too-long|jabber|collision|"
@@ -93,7 +93,7 @@ def link_mode_problem(rate: str, full_duplex) -> str:
 
 def port_issues(ports: List[Dict], old_ports: Optional[List[Dict]] = None) -> List[str]:
     """Problems of the ethernet ports: a link that is not 100M/1G full duplex,
-    error counters above ERROR_LIMIT on a port with link, and flapping (the link
+    error counters at or above PORT_ERRORS on a port with link, and flapping (the link
     went down FLAP_LINK_DOWNS+ times since the previous update)."""
     old = {p.get("name"): p for p in old_ports or []}
     issues = []
@@ -104,7 +104,7 @@ def port_issues(ports: List[Dict], old_ports: Optional[List[Dict]] = None) -> Li
             mode = link_mode_problem(port.get("rate", ""), port.get("full_duplex", ""))
             if mode:
                 found.append(mode)
-            errors = {k: v for k, v in (port.get("errors") or {}).items() if v > ERROR_LIMIT}
+            errors = {k: v for k, v in (port.get("errors") or {}).items() if v >= PORT_ERRORS}
             if errors:
                 worst = sorted(errors.items(), key=lambda kv: -kv[1])[:3]
                 found.append("ошибки " + ", ".join(f"{k}={v}" for k, v in worst))
@@ -160,6 +160,19 @@ def wlan_flap_issues(wireless: List[Dict], old_wireless: Optional[List[Dict]] = 
     return issues
 
 
+def w60g_entry(name: str, mon: Dict[str, str]) -> Optional[Dict]:
+    """A 60 GHz link from «/interface w60g monitor»: rssi (dBm) is the level that is
+    checked; «signal» (link quality) is shown next to it. None when not connected."""
+    if _yes(mon.get("connected", "")) is False or not (mon.get("rssi") or mon.get("signal")):
+        return None
+    rssi = parse_signal(mon.get("rssi", ""))
+    signal = parse_signal(mon.get("signal", ""))
+    if rssi is None and signal is not None and signal < 0:   # some versions give dBm in «signal»
+        rssi, signal = signal, None
+    return {"interface": name, "mac": mon.get("remote-address", ""), "rx": rssi, "tx": None,
+            "quality": signal}
+
+
 def worst_signal(radio: List[Dict]) -> Optional[int]:
     values = [e[side] for e in radio for side in ("rx", "tx") if e.get(side) is not None]
     return min(values) if values else None
@@ -170,6 +183,8 @@ def signal_text(radio: List[Dict]) -> str:
     parts = []
     for entry, label in zip(radio, _radio_labels(radio)):
         sides = [f"{side} {entry[side]}" for side in ("rx", "tx") if entry.get(side) is not None]
+        if entry.get("quality") is not None:
+            sides.append(f"signal {entry['quality']}")
         if sides:
             parts.append(f"{label} " + " / ".join(sides))
     return "; ".join(parts)

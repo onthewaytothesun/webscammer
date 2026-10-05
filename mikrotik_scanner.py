@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -43,15 +44,18 @@ from tkinter import ttk
 
 import core
 import health
+from store import ConfigStore
 import icons
 from applog import setup_logging
 from core import Device, backup_filename, dedupe_devices, expand_targets, split_api_line
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "mt_config.json")  # everything the program keeps (see store.py)
+# the separate files of older versions: moved into CONFIG_FILE on the first start
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
-COMMANDS_FILE = os.path.join(APP_DIR, "commands.json")  # the 10 command drafts, kept always
-DEVICES_FILE = os.path.join(APP_DIR, "devices.json")  # cached scan results
-UI_FILE = os.path.join(APP_DIR, "ui.json")  # user-set column widths
+COMMANDS_FILE = os.path.join(APP_DIR, "commands.json")
+DEVICES_FILE = os.path.join(APP_DIR, "devices.json")
+UI_FILE = os.path.join(APP_DIR, "ui.json")
 BACKUP_DIR = os.path.join(APP_DIR, "Backups")
 CSV_DELIMITER = ";"  # Excel-friendly in RU locale
 
@@ -62,13 +66,13 @@ DATA_COLUMNS = ("IP", "Identity", "Board Name", "RouterOS", "License", "Last see
                 "Last Backup", "Status", "Note")
 # left to right in the table: the favourite star, the data, the signal levels (shown
 # only while the «Слабое радио» filter is on), the Winbox button and the note
-TREE_COLUMNS = ("fav",) + DATA_COLUMNS[:-1] + ("signal", "ping", "router_id", "winbox", "Note")
-EXTRA_COLUMNS = ("fav", "signal", "ping", "router_id", "winbox")   # not data: not sorted or exported
+TREE_COLUMNS = DATA_COLUMNS[:-1] + ("signal", "ping", "router_id", "winbox", "Note")
+EXTRA_COLUMNS = ("signal", "ping", "router_id", "winbox")   # not data: not exported
 OPTIONAL_COLUMNS = ("signal", "ping", "router_id")   # shown only when their checkbox is ticked
 HEADINGS = {
     "IP": "IP", "Identity": "Identity", "Board Name": "Модель", "RouterOS": "RouterOS",
     "License": "License", "Last seen": "Был в сети", "Last Backup": "Последний бэкап",
-    "Status": "Статус", "winbox": "Winbox", "Note": "Заметка", "fav": "★", "signal": "Сигнал",
+    "Status": "Статус", "winbox": "Winbox", "Note": "Заметка", "signal": "Сигнал",
     "ping": "Ping", "router_id": "Router-ID",
 }
 HEALTH_FIELDS = ("serial", "ports", "wireless", "radio", "extended",
@@ -80,7 +84,7 @@ CSV_ALIASES = {**{v: k for k, v in HEADINGS.items()}, **{k: k for k in DATA_COLU
 # default column widths, in characters of the current font (so they fit any font/DPI)
 DEFAULT_CHARS = {"IP": 14, "Identity": 18, "Board Name": 13, "RouterOS": 10, "License": 7,
                  "Last seen": 19, "Last Backup": 19, "Status": 18, "winbox": 8, "Note": 26,
-                 "fav": 1, "signal": 24, "ping": 9, "router_id": 14}
+                 "signal": 24, "ping": 9, "router_id": 14}
 TIME_FORMAT = core.TIME_FORMAT
 WINBOX_LABEL = "▶ Winbox"  # per-row launcher
 MAX_OPS_THREADS = 10  # Backup / SEND run this many devices at once at most
@@ -91,7 +95,7 @@ ERROR_BG, ERROR_FG = "#ffd6d6", "#7a0000"  # rows of devices whose last operatio
 AGE_COLORS = {"age3": "#fff1a0", "age6": "#ffc27d", "age12": "#ff8f8f"}
 # changed since the previous update (until a backup saves it) / port problems / weak radio
 STATE_COLORS = {"changed": "#d9b8f5", "port": "#8db4f0", "radio": "#c4ecff"}
-FAV_MARK = "★"
+DUP_RID_BG, DUP_RID_FG = "#ff7a7a", "#000000"   # the same Router-ID on several devices
 ROW_FRAME_COLOR = "#1a4fd6"   # the frame around the row last worked with
 AGE_CHOICES = (("Любой возраст", 0), ("Старше 3 мес.", 3), ("Старше 6 мес.", 6), ("Старше 12 мес.", 12))
 COMMAND_HINTS = {
@@ -109,6 +113,9 @@ class ScannerApp:
 
         # file logging for observability (logs/scanner-*.log next to program)
         self.logger, self.log_path = setup_logging(APP_DIR)
+        self.store = ConfigStore(CONFIG_FILE, legacy={
+            "settings": SETTINGS_FILE, "commands": COMMANDS_FILE, "devices": DEVICES_FILE, "ui": UI_FILE,
+        }, logger=self.logger)
 
         # runtime state
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -162,6 +169,8 @@ class ScannerApp:
         self._drag_column = None
         self._current_row = None                  # the row last clicked: drawn with a frame
         self._row_frame_box = None
+        self._dup_router_ids: set = set()           # Router-IDs found on more than one device
+        self._rid_dirty = True
         self._search_nets: list = []   # subnets typed in the search box (10.20.30.0/24)
         self._signal_limit = None   # the parsed «не лучше» value, dBm
         self._baselines: dict = {}   # iid -> the device as it was before the running scan / update
@@ -170,6 +179,9 @@ class ScannerApp:
         self._fit_window_to_fields()
         self._set_app_icon()
         self._load_settings()
+        if not self.store.has("networks") and self.var_network.get().strip():
+            # versions before «Обновить» searched for new devices kept no list of subnets
+            self._remember_networks(self.var_network.get())
         self._load_devices()
         self._after_id = self.root.after(100, self._drain_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -322,6 +334,7 @@ class ScannerApp:
         ttk.Button(actions, text="Бэкап", command=self.on_backup).pack(side=LEFT, padx=2)
         ttk.Button(actions, text="Подтвердить", command=self.on_confirm).pack(side=LEFT, padx=(10, 2))
         ttk.Button(actions, text="★ Избранное", command=self.on_favorite).pack(side=LEFT, padx=2)
+        ttk.Button(actions, text="Открыть бэкапы", command=self.on_open_backups).pack(side=LEFT, padx=(10, 2))
         ttk.Label(actions, text="Команда:").pack(side=RIGHT, padx=(2, 4))
         ttk.Button(actions, text="Отправить", command=self.on_send).pack(side=RIGHT, padx=2)
 
@@ -368,6 +381,8 @@ class ScannerApp:
             ttk.Label(legend, text=text).pack(side=LEFT)
         tk.Label(legend, width=2, bg=ERROR_BG, bd=1, relief="solid").pack(side=LEFT, padx=(10, 2))
         ttk.Label(legend, text="ошибка").pack(side=LEFT)
+        tk.Label(legend, width=2, bg=DUP_RID_BG, bd=1, relief="solid").pack(side=LEFT, padx=(6, 2))
+        ttk.Label(legend, text="дубль Router-ID").pack(side=LEFT)
         for tag, text in (("changed", "изменения"), ("port", "порт"), ("radio", "радио")):
             tk.Label(legend, width=2, bg=STATE_COLORS[tag], bd=1, relief="solid").pack(side=LEFT, padx=(6, 2))
             ttk.Label(legend, text=text).pack(side=LEFT)
@@ -427,12 +442,12 @@ class ScannerApp:
         self.tree.column("#0", width=self._icon_w + 14, minwidth=self._icon_w + 6,
                          anchor="w", stretch=False)
         for col in TREE_COLUMNS:
-            if col in EXTRA_COLUMNS:
+            if col == "winbox":
                 self.tree.heading(col, text=HEADINGS[col])
             else:
                 self.tree.heading(col, text=HEADINGS[col], command=lambda c=col: self.sort_by(c))
             self.tree.column(col, width=self._default_width(col), stretch=False,
-                             anchor="center" if col in ("winbox", "fav") else "w")
+                             anchor="center" if col == "winbox" else "w")
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -440,6 +455,7 @@ class ScannerApp:
         hsb.pack(side="bottom", fill=X)
         self.tree.pack(fill=BOTH, expand=True)
         self.tree.tag_configure("error", background=ERROR_BG, foreground=ERROR_FG)
+        self.tree.tag_configure("dup_rid", background=DUP_RID_BG, foreground=DUP_RID_FG)
         for tag, color in list(AGE_COLORS.items()) + list(STATE_COLORS.items()):
             self.tree.tag_configure(tag, background=color, foreground="#000000")
         self._show_signal_column(False)
@@ -635,9 +651,30 @@ class ScannerApp:
         self._render_progress()
         if self._models_dirty:
             self._refresh_model_choices()
+        if self._rid_dirty:
+            self._refresh_duplicate_router_ids()
         if self._counts_dirty:
             self._update_counts()
         self._place_row_frame()
+
+    def _refresh_duplicate_router_ids(self) -> None:
+        """Router-IDs set on more than one device: those rows turn red."""
+        self._rid_dirty = False
+        seen: dict = {}
+        for dev in self.devices.values():
+            if dev.router_id:
+                seen[dev.router_id] = seen.get(dev.router_id, 0) + 1
+        dups = {rid for rid, n in seen.items() if n > 1}
+        changed = dups ^ self._dup_router_ids
+        self._dup_router_ids = dups
+        if not changed:
+            return
+        for iid, dev in self.devices.items():
+            if self.tree.exists(iid) and (dev.router_id in changed
+                                          or "dup_rid" in self.tree.item(iid, "tags")):
+                self.tree.item(iid, tags=self._row_tags(dev))
+                self._apply_visibility(iid)
+        self._counts_dirty = True
 
     # ---- the row last worked with is drawn with a frame until another row is clicked
     def _set_current_row(self, iid: str) -> None:
@@ -700,14 +737,11 @@ class ScannerApp:
 
     def _default_width(self, column: str) -> int:
         font = tkfont.nametofont("TkDefaultFont")
-        if column == "fav":
-            return font.measure(FAV_MARK) + 20
         return max(font.measure("0" * DEFAULT_CHARS[column]), font.measure(HEADINGS[column]) + 30) + 22
 
     def _row_values(self, dev: Device) -> tuple:
         row = dev.as_row()
-        row.update(winbox=WINBOX_LABEL, fav=FAV_MARK if dev.favorite else "",
-                   signal=health.signal_text(dev.radio), ping=dev.ping, router_id=dev.router_id)
+        row.update(winbox=WINBOX_LABEL, signal=health.signal_text(dev.radio), ping=dev.ping, router_id=dev.router_id)
         return tuple(row[c] for c in TREE_COLUMNS)
 
     def _row_image(self, iid: str):
@@ -716,6 +750,8 @@ class ScannerApp:
     def _row_tags(self, dev: Device) -> tuple:
         """One colour tag per row: red for a failed device, purple for unsaved changes,
         blue for port problems, light blue for weak radio, else by age of the last backup."""
+        if dev.router_id and dev.router_id in self._dup_router_ids:
+            return ("dup_rid",)
         if health.open_problem(dev, "error"):
             return ("error",)
         for tag, flag in (("changed", dev.changes), ("port", health.open_problem(dev, "port")),
@@ -754,7 +790,8 @@ class ScannerApp:
     def _matches_filter(self, dev: Device) -> bool:
         if self._models_sel and self._model_key(dev) not in self._models_sel:
             return False
-        if self.var_errors_only.get() and not health.open_problem(dev, "error"):
+        if self.var_errors_only.get() and not (health.open_problem(dev, "error")
+                                               or dev.router_id in self._dup_router_ids):
             return False
         if self.var_no_backup.get() and dev.last_backup:
             return False
@@ -765,6 +802,10 @@ class ScannerApp:
         if self.var_weak_radio.get() and not health.open_problem(dev, "radio"):
             return False
         if self.var_confirmed.get() and not dev.confirmed:
+            return False
+        if self.var_signal_show.get() and health.worst_signal(dev.radio) is None:
+            return False
+        if self.var_router_id_show.get() and not dev.router_id:
             return False
         if self._signal_limit is not None:
             worst = health.worst_signal(dev.radio)
@@ -806,11 +847,22 @@ class ScannerApp:
             return (0, tuple(int(p) for p in parts))   # IP addresses sort numerically
         return (1, value.lower())
 
+    def _column_sort_key(self, dev: Device, column: str):
+        if column == "signal":       # the worst signal, numerically; devices without radio last
+            worst = health.worst_signal(dev.radio)
+            return (0, worst) if worst is not None else (1, 0)
+        if column == "ping":
+            m = re.match(r"<?(\d+)", dev.ping or "")
+            return (0, int(m.group(1))) if m else (1, 0)
+        if column == "router_id":
+            return self._sort_key(dev.router_id) if dev.router_id else (2, "")
+        return self._sort_key(dev.as_row()[column])
+
     def _ordered_iids(self) -> list:
         iids = list(self.devices)
         if self._sort:
             column, reverse = self._sort
-            iids.sort(key=lambda i: self._sort_key(self.devices[i].as_row()[column]), reverse=reverse)
+            iids.sort(key=lambda i: self._column_sort_key(self.devices[i], column), reverse=reverse)
         return iids
 
     def _relayout(self) -> None:
@@ -1041,7 +1093,7 @@ class ScannerApp:
                              tags=self._row_tags(dev))
         self.devices[iid] = dev
         self._apply_visibility(iid)
-        self._counts_dirty = self._models_dirty = True
+        self._counts_dirty = self._models_dirty = self._rid_dirty = True
 
     def _accept_polled(self, dev: Device) -> None:
         """A device just read by a scan / update: compare it with how it was before
@@ -1090,8 +1142,6 @@ class ScannerApp:
             self.on_winbox(iid)
         elif self._shown_column(col) == "ping":
             self.on_ping(iid)
-        elif self._shown_column(col) == "fav":
-            self._set_favorite([iid], not self.devices[iid].favorite)
 
     def _set_checked(self, iid: str, state: bool) -> None:
         if state:
@@ -1124,7 +1174,7 @@ class ScannerApp:
         """Data column key for a '#N' id from identify_column; None for the
         checkbox / update column and for the Winbox button."""
         name = self._shown_column(column_id)
-        return name if name not in ("fav", "winbox") else None
+        return name if name != "winbox" else None
 
     def _shown_column(self, column_id: str):
         """Column key for a '#N' id (counted among the columns shown; «Сигнал» may be hidden)."""
@@ -1160,9 +1210,11 @@ class ScannerApp:
             return
         path = core.latest_backup_file(BACKUP_DIR, dev.ip)
         if path is None:
-            if dev.last_backup:  # the table says there was one, but the file is gone
-                messagebox.showinfo(
-                    "Бэкап", f"Файл бэкапа для {dev.ip} не найден в папке:\n{BACKUP_DIR}")
+            if dev.last_backup and not messagebox.askyesno(   # the table says there was one, but the file is gone
+                    "Бэкап", f"Файл бэкапа для {dev.ip} не найден в папке:\n{BACKUP_DIR}\n\n"
+                             "Указать файл бэкапа, сделанного вручную?"):
+                return
+            self.attach_manual_backup(iid)
             return
         try:
             core.open_with_default_app(path)
@@ -1173,6 +1225,45 @@ class ScannerApp:
                          "Возможно, для файлов .rsc не назначена программа по умолчанию.")
             return
         self.log(f"{dev.ip}: открыт {os.path.basename(path)}")
+
+    def attach_manual_backup(self, iid: str, path: str = "") -> None:
+        """A device without a backup: pick a backup made by hand. It is copied into
+        Backups/ under the usual name (IP_Identity_date, its own extension kept)
+        and its time becomes «Последний бэкап»."""
+        import shutil
+        dev = self.devices.get(iid)
+        if dev is None:
+            return
+        path = path or filedialog.askopenfilename(
+            title=f"Бэкап {dev.ip} ({dev.identity}): укажите файл, сделанный вручную",
+            filetypes=[("Бэкап RouterOS", "*.rsc *.backup"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            stamp = datetime.fromtimestamp(os.path.getmtime(path))
+            ext = os.path.splitext(path)[1].lower()
+            ext = ext if ext in (".rsc", ".backup") else ".rsc"   # a text export under another name
+            name = os.path.splitext(backup_filename(dev.ip, dev.identity, stamp.date()))[0] + ext
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            core.archive_backups(BACKUP_DIR, dev.ip)
+            shutil.copy2(path, os.path.join(BACKUP_DIR, name))   # copy2 keeps the file time
+        except OSError as exc:
+            messagebox.showerror("Бэкап", f"Не удалось скопировать файл:\n{path}\n\n{exc}")
+            return
+        dev.last_backup = stamp.strftime(TIME_FORMAT)
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=self._row_values(dev), tags=self._row_tags(dev))
+        self._apply_visibility(iid)
+        self._save_devices()
+        self.log(f"{dev.ip}: бэкап, сделанный вручную, добавлен -> Backups/{name}")
+
+    def on_open_backups(self) -> None:
+        """«Открыть бэкапы»: the Backups folder in the file manager."""
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        try:
+            core.open_with_default_app(BACKUP_DIR)
+        except OSError as exc:
+            messagebox.showerror("Бэкапы", f"Не удалось открыть папку:\n{BACKUP_DIR}\n\n{exc}")
 
     # ---- the note of a device
     def _edit_note(self, iid: str) -> None:
@@ -1316,22 +1407,14 @@ class ScannerApp:
     def _save_ui_state(self) -> None:
         widths = {name: int(self.tree.column(name, "width"))
                   for name in ("#0",) + tuple(self.tree.cget("columns"))}
-        try:
-            tmp = UI_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"column_widths": widths, "column_order": self._column_order}, fh, indent=1)
-            os.replace(tmp, UI_FILE)
-        except OSError as exc:
-            self.logger.warning("could not save column widths: %s", exc)
+        self.store.set("ui", {"column_widths": widths, "column_order": self._column_order})
 
     def _load_ui_state(self) -> None:
-        try:
-            with open(UI_FILE, encoding="utf-8") as fh:
-                data = json.load(fh)
-            widths = data.get("column_widths", {})
-            saved_order = data.get("column_order", [])
-        except (OSError, ValueError, AttributeError):
+        data = self.store.get("ui", {})
+        if not isinstance(data, dict):
             return
+        widths = data.get("column_widths", {})
+        saved_order = data.get("column_order", [])
         if isinstance(saved_order, list):
             order = [c for c in dict.fromkeys(saved_order) if c in TREE_COLUMNS]
             for index, column in enumerate(TREE_COLUMNS):   # columns added in a newer version
@@ -1628,8 +1711,6 @@ class ScannerApp:
             if dev is None:
                 continue
             dev.favorite = state
-            if self.tree.exists(iid):
-                self.tree.set(iid, "fav", FAV_MARK if state else "")
             self._apply_visibility(iid)
         self._save_devices()
         self.log(f"{'Добавлено в избранное' if state else 'Убрано из избранного'}: {len(iids)}")
@@ -1868,6 +1949,7 @@ class ScannerApp:
         targets = self._network_targets()
         if targets is None:
             return
+        self._remember_networks(self.var_network.get())
         self._start_scan(targets, "Скан")
 
     def on_scan(self) -> None:
@@ -1886,24 +1968,64 @@ class ScannerApp:
         if targets is None:
             return
         self._clear_table()
+        self._remember_networks(self.var_network.get(), replace=True)
         self._start_scan(targets, "Новый скан")
 
     def on_update(self) -> None:
-        """Обновить: reconnect to the devices that are shown in the table (all of them
-        unless a filter is on); the «Сеть» field is not used."""
+        """Обновить: the ticked devices that are shown; with nothing ticked, every device
+        shown (all of them unless a filter is on) and, in addition, the subnets scanned
+        before with «Скан» are searched for new devices. The «Сеть» field is not used."""
         if self._busy():
             return
+        ticked = self.selected_iids()
         targets, alternatives = [], {}
-        for iid in self._visible_iids():
+        for iid in ticked or self._visible_iids():
             dev = self.devices[iid]
             hosts = core.connect_candidates(dev) or [dev.reach_ip]
             if hosts[0] and hosts[0] not in targets:
                 targets.append(hosts[0])
                 alternatives[hosts[0]] = hosts[1:]   # tried when the first one does not answer
-        if not targets:
+        extra = [] if ticked else self._discovery_targets(set(targets))
+        if not targets and not extra:
             messagebox.showinfo("Обновить", "В таблице нет устройств для обновления. Сначала выполните «Скан».")
             return
-        self._start_scan(targets, "Обновление", alternatives)
+        if extra:
+            self.log(f"Обновление: устройств {len(targets)}, поиск новых в подсетях "
+                     f"{', '.join(self._networks())}: ещё адресов {len(extra)}.")
+            self._start_scan(targets + extra, "Обновление и поиск новых", alternatives)
+        else:
+            if ticked:
+                self.log(f"Обновление отмеченных устройств: {len(ticked)}.")
+            self._start_scan(targets, "Обновление", alternatives)
+
+    # ---- the subnets scanned with «Скан» / «Новый скан», searched again by «Обновить»
+    def _networks(self) -> list:
+        nets = self.store.get("networks", [])
+        return [n for n in nets if isinstance(n, str)] if isinstance(nets, list) else []
+
+    def _remember_networks(self, spec: str, replace: bool = False) -> None:
+        tokens = [t for t in re.split(r"[,\s]+", spec.strip()) if t]
+        nets = [] if replace else self._networks()
+        for token in tokens:
+            if token not in nets:
+                nets.append(token)
+        self.store.set("networks", nets)
+
+    def _discovery_targets(self, skip: set) -> list:
+        """Addresses of the remembered subnets that no device in the table has
+        (client addresses of known devices are never probed)."""
+        known = set(skip)
+        for dev in self.devices.values():
+            known.update(core.all_ips(dev))
+        found = []
+        for spec in self._networks():
+            try:
+                hosts = expand_targets(spec)
+            except ValueError:
+                continue
+            found.extend(ip for ip in hosts if ip not in known)
+            known.update(hosts)
+        return found
 
     def _targets_or_warn(self):
         """Expand the «Сеть» field; None (after a message) if it's invalid."""
@@ -1977,12 +2099,13 @@ class ScannerApp:
             job["new"] = len(new_keys)
             self.ui_queue.put(("done", dedupe_devices(found)))
 
-        scanning = kind != "Обновление"
+        scanning = kind != "Обновление"       # count the devices that are new in the table
         transport = (f"SSH {cfg['ssh_port']}" if cfg["cmdtype"] == "SSH" else
                      f"API-SSL {cfg['api_ssl_port']} (обычный API 8728 — если порт закрыт)")
         self.log(f"{kind}: адресов {len(targets)}, потоков {cfg['threads']}, "
                  f"таймаут {cfg['timeout']:g} с, повторов {cfg['retries']}, {transport}.")
-        self._start_job("Сканирование" if scanning else "Обновление", targets, scan_one, cfg["threads"],
+        self._start_job("Обновление" if kind.startswith("Обновление") else "Сканирование",
+                        targets, scan_one, cfg["threads"],
                         ok_label="найдено", on_finish=finish,
                         extra={"new": 0} if scanning else None)
 
@@ -2187,7 +2310,7 @@ class ScannerApp:
             self._hidden.discard(iid)
         self._anchor = None
         self._sync_header()
-        self._counts_dirty = self._models_dirty = True
+        self._counts_dirty = self._models_dirty = self._rid_dirty = True
         self._save_devices()
         self.log(f"Удалено из таблицы устройств: {len(iids)}."
                  + (f" Бэкапов перенесено в Backups/Old: {archived}." if archived else ""))
@@ -2277,25 +2400,18 @@ class ScannerApp:
                 self._apply_visibility(iid)
 
     def _save_devices(self) -> None:
-        try:
-            rows = [dataclasses.asdict(d) for d in self.devices.values()]
-            tmp = DEVICES_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(rows, fh, indent=1)
-            os.replace(tmp, DEVICES_FILE)  # a crash mid-write must not destroy the cache
+        rows = [dataclasses.asdict(d) for d in self.devices.values()]
+        if self.store.set("devices", rows):
             self._last_cache_save = time.monotonic()
-        except (OSError, TypeError) as exc:
-            self.log(f"Не удалось сохранить список устройств: {exc}")
+        else:
+            self.log(f"Не удалось сохранить список устройств в {os.path.basename(CONFIG_FILE)}: "
+                     f"{self.store.error}")
 
     def _load_devices(self) -> None:
-        if not os.path.exists(DEVICES_FILE):
-            return
-        try:
-            with open(DEVICES_FILE, encoding="utf-8") as fh:
-                rows = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            self._write_log(f"Не удалось прочитать devices.json ({exc}); таблица пуста.")
-            return
+        if self.store.error:
+            self._write_log(f"Не удалось прочитать {os.path.basename(CONFIG_FILE)} ({self.store.error}); "
+                            "он сохранён как .broken, начинаем с пустыми настройками.")
+        rows = self.store.get("devices", [])
         allowed = {f.name for f in dataclasses.fields(Device)}
         loaded = 0
         for row in rows if isinstance(rows, list) else []:
@@ -2336,21 +2452,14 @@ class ScannerApp:
     def _maybe_save_settings(self) -> None:
         if self.var_save.get():
             self._save_settings()
-        elif os.path.exists(SETTINGS_FILE):
+        elif self.store.has("settings"):
             # Save was unticked: forget the stored settings (incl. password)
-            try:
-                os.remove(SETTINGS_FILE)
-            except OSError as exc:
-                self.log(f"Не удалось удалить сохранённые настройки: {exc}")
+            if not self.store.remove("settings"):
+                self.log(f"Не удалось удалить сохранённые настройки: {self.store.error}")
 
     def _save_settings(self) -> None:
         self._command_tab_changed()
-        data = {}
-        try:
-            with open(SETTINGS_FILE, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            pass
+        data = dict(self.store.get("settings", {}) or {})
         data.update({
             "user": self.var_user.get(),
             "network": self.var_network.get(),
@@ -2363,26 +2472,18 @@ class ScannerApp:
             "retries": self.var_retries.get(),
             "save": True,
         })
-        # the command drafts live in commands.json now (kept even without «Запомнить настройки»)
+        # the command drafts are kept separately (even without «Запомнить настройки»)
         for key in ("command", "commands", "active_command"):
             data.pop(key, None)
         self._save_commands()
         # Password is stored only when Save is ticked; base64 is obfuscation,
         # not encryption — the file is local to the operator's machine.
         data["password"] = base64.b64encode(self.var_pass.get().encode()).decode()
-        try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2)
-        except OSError as exc:
-            self.log(f"Не удалось сохранить настройки: {exc}")
+        if not self.store.set("settings", data):
+            self.log(f"Не удалось сохранить настройки: {self.store.error}")
 
     def _load_settings(self) -> None:
-        data = {}
-        try:
-            with open(SETTINGS_FILE, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            pass
+        data = self.store.get("settings", {})
         if not isinstance(data, dict):
             data = {}
         self._load_commands(data)
@@ -2404,28 +2505,18 @@ class ScannerApp:
             except Exception:  # noqa: BLE001
                 pass
 
-    # ---- the 10 command drafts: commands.json, saved always (no password in it)
+    # ---- the 10 command drafts: section "commands", saved always (no password in it)
     def _save_commands(self) -> None:
         self._command_tab_changed()
         data = {"commands": [editor.get("1.0", "end-1c") for editor in self.command_editors],
                 "active_command": self.active_command}
-        try:
-            tmp = COMMANDS_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=1)
-            os.replace(tmp, COMMANDS_FILE)
-        except OSError as exc:
-            self.log(f"Не удалось сохранить тексты команд: {exc}")
+        if not self.store.set("commands", data):
+            self.log(f"Не удалось сохранить тексты команд: {self.store.error}")
 
     def _load_commands(self, legacy: dict | None = None) -> None:
-        """Drafts from commands.json; without it, from an older settings.json
-        (its ten "commands", or the single "command" of earlier versions)."""
-        data = None
-        try:
-            with open(COMMANDS_FILE, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            pass
+        """Drafts from the "commands" section; without it, from older settings
+        (their ten "commands", or the single "command" of earlier versions)."""
+        data = self.store.get("commands")
         if not isinstance(data, dict):
             data = legacy or {}
             if not isinstance(data.get("commands"), list) and not data.get("command"):

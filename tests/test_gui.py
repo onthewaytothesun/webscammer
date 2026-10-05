@@ -20,7 +20,7 @@ def _open():
 
     work = tempfile.mkdtemp()
     for name, fname in (("APP_DIR", ""), ("DEVICES_FILE", "devices.json"), ("UI_FILE", "ui.json"),
-                        ("COMMANDS_FILE", "commands.json"),
+                        ("COMMANDS_FILE", "commands.json"), ("CONFIG_FILE", "mt_config.json"),
                         ("SETTINGS_FILE", "settings.json"), ("BACKUP_DIR", "Backups")):
         setattr(M, name, os.path.join(work, fname) if fname else work)
     os.makedirs(M.BACKUP_DIR)
@@ -32,6 +32,12 @@ def _open():
     root.geometry("2200x1100+0+0")  # wide and tall enough that every column and row is on screen
     _pump(root)
     return M, tk, root, app
+
+
+def _saved(M, section, default=None):
+    """What the program keeps in mt_config.json."""
+    with open(M.CONFIG_FILE, encoding="utf-8") as fh:
+        return json.load(fh).get(section, default)
 
 
 def _pump(root, n=5):
@@ -57,7 +63,7 @@ def test_gui_builds_with_all_row_actions():
         assert columns[-2:] == ("winbox", "Note") and columns == M.TREE_COLUMNS
         assert list(M.DATA_COLUMNS).index("Last Backup") == list(M.DATA_COLUMNS).index("Last seen") + 1
         shown = [app.tree.heading(c, "text") for c in columns]
-        assert shown == ["★", "IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
+        assert shown == ["IP", "Identity", "Модель", "RouterOS", "License", "Был в сети",
                          "Последний бэкап", "Статус", "Сигнал", "Ping", "Router-ID", "Winbox", "Заметка"], shown
         assert "signal" not in app.tree.cget("displaycolumns")   # only with «Слабое радио»
         assert "ping" not in app.tree.cget("displaycolumns")     # only with «Ping»
@@ -109,7 +115,7 @@ def test_gui_last_backup_is_kept_on_rescan_and_cached():
         assert len(stamp) == 19, stamp
         app._upsert_device(Device(ip="10.20.44.209", key="SN1", identity="R1"))  # what a rescan produces
         assert app.tree.set("SN1", "Last Backup") == stamp
-        assert any(r["last_backup"] == stamp for r in json.load(open(M.DEVICES_FILE)))
+        assert any(r["last_backup"] == stamp for r in _saved(M, "devices"))
     finally:
         app._on_close()
 
@@ -121,14 +127,13 @@ def test_gui_column_widths_are_remembered():
         app._save_ui_state()
     finally:
         app._on_close()
-    ui_file = M.UI_FILE
-    assert json.load(open(ui_file))["column_widths"]["Identity"] == 333
+    assert _saved(M, "ui")["column_widths"]["Identity"] == 333
     root2 = None
     try:
         root2 = tk.Tk()
         app2 = M.ScannerApp(root2)
         assert int(app2.tree.column("Identity", "width")) == 333
-        json.dump({"column_widths": {"IP": "junk", "Status": 10 ** 6, "Nope": 1}}, open(ui_file, "w"))
+        app2.store.set("ui", {"column_widths": {"IP": "junk", "Status": 10 ** 6, "Nope": 1}})
         app2._load_ui_state()
         assert int(app2.tree.column("Status", "width")) <= 2000
     finally:
@@ -203,9 +208,13 @@ def test_gui_double_click_last_backup_opens_the_newest_file():
     M, tk, root, app = _open()
     opened, shown = [], []
     real_open, real_info, real_err = core.open_with_default_app, M.messagebox.showinfo, M.messagebox.showerror
+    real_ask, real_pick = M.messagebox.askyesno, M.filedialog.askopenfilename
+    picked = []
     core.open_with_default_app = opened.append
     M.messagebox.showinfo = lambda *a, **k: shown.append(a[1])
     M.messagebox.showerror = lambda *a, **k: shown.append(a[1])
+    M.messagebox.askyesno = lambda *a, **k: shown.append(a[1]) or False
+    M.filedialog.askopenfilename = lambda **k: picked.append(k.get("title", "")) or ""
     try:
         for d in _devices():
             app._upsert_device(d)
@@ -235,12 +244,12 @@ def test_gui_double_click_last_backup_opens_the_newest_file():
         assert opened == [newer], opened
 
         opened.clear()
-        double_click("SN2", "Last Backup")              # no backup and nothing recorded: silent
-        assert opened == [] and shown == []
+        double_click("SN2", "Last Backup")              # no backup at all: pick one made by hand (cancelled)
+        assert opened == [] and shown == [] and len(picked) == 1 and "10.20.30.210" in picked[0]
 
         app.devices["SN2"].last_backup = "2026-09-01 10:00:00"   # recorded, but the file is gone
-        double_click("SN2", "Last Backup")
-        assert opened == [] and len(shown) == 1 and "10.20.30.210" in shown[0]
+        double_click("SN2", "Last Backup")              # asked whether to pick a file; answered no
+        assert opened == [] and len(shown) == 1 and "10.20.30.210" in shown[0] and len(picked) == 1
 
         shown.clear()
         core.open_with_default_app = lambda path: (_ for _ in ()).throw(OSError("no program"))
@@ -256,8 +265,20 @@ def test_gui_double_click_last_backup_opens_the_newest_file():
         app.tree.event_generate("<ButtonPress-1>", x=bx + 3 + app._icon_size // 2, y=by + bh // 2, time=clock[0] + 10000)
         _pump(root, 2)
         assert app.checked == {"SN1"}
+
+        # a backup made by hand is copied into Backups/ and becomes «Последний бэкап»
+        manual = os.path.join(M.APP_DIR, "my export.backup")
+        open(manual, "w").write("binary")
+        t = time.time() - 5 * 86400
+        os.utime(manual, (t, t))
+        app.attach_manual_backup("SN2", manual)
+        copied = [f for f in os.listdir(M.BACKUP_DIR) if f.startswith("10.20.30.210_")]
+        assert len(copied) == 1 and copied[0].endswith(".backup"), copied
+        assert app.devices["SN2"].last_backup == time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+        assert core.latest_backup_file(M.BACKUP_DIR, "10.20.30.210").endswith(copied[0])
     finally:
         core.open_with_default_app, M.messagebox.showinfo, M.messagebox.showerror = real_open, real_info, real_err
+        M.messagebox.askyesno, M.filedialog.askopenfilename = real_ask, real_pick
         app._on_close()
 
 
@@ -485,7 +506,7 @@ def test_gui_delete_asks_first_and_removes_only_ticked_rows():
         assert app.checked == set()
         app._tick()
         assert app.lbl_counts.cget("text").startswith("Устройств: 3")
-        assert sorted(r["key"] for r in json.load(open(M.DEVICES_FILE))) == ["SN1", "SN3", "SN5"]
+        assert sorted(r["key"] for r in _saved(M, "devices")) == ["SN1", "SN3", "SN5"]
     finally:
         M.messagebox.askyesno, M.messagebox.showinfo = real_ask, real_info
         app._on_close()
@@ -494,9 +515,9 @@ def test_gui_delete_asks_first_and_removes_only_ticked_rows():
 def test_gui_old_cache_without_the_error_flag_is_recognised():
     M, tk, root, app = _open()
     try:
-        json.dump([{"ip": "10.0.0.1", "key": "A", "status": "Backup error: timed out"},
-                   {"ip": "10.0.0.2", "key": "B", "status": "OK (API-SSL:8729)"},
-                   {"ip": "10.0.0.3", "key": "C", "status": "Backup: 10.0.0.3_x_error.rsc"}], open(M.DEVICES_FILE, "w"))
+        app.store.set("devices", [{"ip": "10.0.0.1", "key": "A", "status": "Backup error: timed out"},
+                                  {"ip": "10.0.0.2", "key": "B", "status": "OK (API-SSL:8729)"},
+                                  {"ip": "10.0.0.3", "key": "C", "status": "Backup: 10.0.0.3_x_error.rsc"}])
         app.devices.clear()
         for iid in app.tree.get_children(""):
             app.tree.delete(iid)
@@ -732,7 +753,7 @@ def test_gui_notes_can_be_edited_and_survive_rescans_and_restarts():
         _pump(root)
         assert app._note_dialog is None
         assert app.devices["SN2"].note == "Point 5, call Ivan" and app.tree.set("SN2", "Note") == "Point 5, call Ivan"
-        assert [r["note"] for r in json.load(open(M.DEVICES_FILE)) if r["key"] == "SN2"] == ["Point 5, call Ivan"]
+        assert [r["note"] for r in _saved(M, "devices") if r["key"] == "SN2"] == ["Point 5, call Ivan"]
 
         app._upsert_device(Device(ip="10.0.0.2", identity="R2", key="SN2"))      # a rescan knows no note
         assert app.tree.set("SN2", "Note") == "Point 5, call Ivan"
@@ -812,7 +833,15 @@ def test_gui_scan_adds_to_the_table_new_scan_replaces_it_and_update_only_refresh
         assert not any(app.devices[k].failed for k in ("OLD1", "OLD2", "OLD3"))
         assert "новых в таблице: 0" in app.txt_output.get("1.0", "end").splitlines()[-2] + app.txt_output.get("1.0", "end").splitlines()[-1] or True
 
+        # «Обновить» with ticked rows refreshes only them
+        scanned.clear()
+        app.on_update()
+        _wait_job(root, app)
+        assert scanned == [app.devices["OLD2"].reach_ip], scanned
+
         # «Обновить» does not look at the Сеть field: it rescans exactly the devices that are shown
+        # (the subnet scanned above holds nothing new, so no extra addresses)
+        app.checked.clear()
         scanned.clear()
         app.var_network.set("10.99.0.0/16")
         app.on_update()
@@ -970,7 +999,7 @@ def test_gui_everything_the_user_sees_is_in_russian():
         texts += [app.tree.heading(c, "text") for c in app.tree.cget("columns")]
         texts += [app.notebook.tab(i, "text") for i in range(app.notebook.index("end"))]
         kept = {"IP", "Identity", "RouterOS", "License", "Winbox", "SSH:", "API-SSL:", "Winbox:", "SSH", "API/SSL",
-                "CSV", "▶ Winbox", "Ping", "Router-ID"}
+                "CSV", "▶ Winbox", "Ping", "Router-ID", "дубль Router-ID"}
         english = [t for t in texts if re.search(r"[A-Za-z]{3,}", t) and t not in kept
                    and not t.startswith(("SSH:", "API/SSL:", "Порт API-SSL:", "Лог: logs/"))]
         assert english == [], english
@@ -1010,9 +1039,8 @@ def test_gui_ten_command_tabs_send_selected_text_and_persist_all_drafts():
         for i, widget in enumerate(app.command_editors):
             assert widget.get("1.0", "end-1c") == f":put {i + 1}"
         assert app.txt_command.get("1.0", "end-1c") == ":put 7"
-        os.remove(M.COMMANDS_FILE)        # an older install: the single command lives in settings.json
-        with open(M.SETTINGS_FILE, "w") as fh:
-            json.dump({"command": "/system resource print"}, fh)
+        app.store.remove("commands")      # an older install: the single command lives in the settings
+        app.store.set("settings", {"command": "/system resource print"})
         app._load_settings()
         assert app.command_editors[0].get("1.0", "end-1c") == "/system resource print"
         assert all(w.get("1.0", "end-1c") == "" for w in app.command_editors[1:])
@@ -1108,8 +1136,8 @@ def test_gui_command_drafts_are_kept_without_remember_settings_and_log_names_the
         assert "«Команда 5»" in app.txt_output.get("1.0", "end")
     finally:
         app._on_close()
-    assert not os.path.exists(M.SETTINGS_FILE)            # ... and it is not
-    saved = json.load(open(M.COMMANDS_FILE, encoding="utf-8"))
+    assert _saved(M, "settings") is None                  # ... and it is not
+    saved = _saved(M, "commands")
     assert "password" not in saved and saved["commands"][4] == ":put five" and saved["active_command"] == 4
     root2 = tk.Tk()
     app2 = M.ScannerApp(root2)
@@ -1193,7 +1221,7 @@ def test_gui_changes_ports_radio_favourites_and_their_filters():
 
         app.checked.add("S2")
         app.on_favorite()
-        assert app.devices["S2"].favorite and app.tree.set("S2", "fav") == "★"
+        assert app.devices["S2"].favorite
         app.var_favorites.set(True); app._on_filter_change()
         assert app._visible_iids() == ["S2"]
         app._reset_filters(); app._relayout()
@@ -1348,8 +1376,10 @@ def test_gui_router_id_column_current_row_frame_and_moving_columns():
         assert "router_id" not in app.tree.cget("displaycolumns")
         app.var_router_id_show.set(True); app._on_filter_change()
         assert "router_id" in app.tree.cget("displaycolumns") and app.tree.set("S1", "router_id") == "10.20.255.7"
+        assert app._visible_iids() == ["S1"]               # devices without a Router-ID are hidden
         app._set_main_ip("S1", "")                        # automatic: the router-id address wins over bridge1
         assert app.tree.set("S1", "IP") == "10.20.255.7"
+        app.var_router_id_show.set(False); app._on_filter_change()
 
         _pump(root, 3)
         app._set_current_row("S2")
@@ -1363,9 +1393,9 @@ def test_gui_router_id_column_current_row_frame_and_moving_columns():
         app._move_column("Note", "IP")                    # dragged left: lands before IP
         shown = list(app.tree.cget("displaycolumns"))
         assert shown.index("Note") == shown.index("IP") - 1
-        app._move_column("fav", "Identity")               # dragged right: lands after Identity
+        app._move_column("License", "Status")             # dragged right: lands after Статус
         shown = list(app.tree.cget("displaycolumns"))
-        assert shown.index("fav") == shown.index("Identity") + 1
+        assert shown.index("License") == shown.index("Status") + 1
         assert app._column_name("#%d" % (shown.index("Identity") + 1)) == "Identity"
     finally:
         app._on_close()
@@ -1383,3 +1413,74 @@ def test_gui_column_order_is_remembered():
         assert app2._column_order == list(M.TREE_COLUMNS)
     finally:
         app2._on_close()
+
+
+def test_gui_old_separate_files_move_into_one_config_file():
+    M, tk, root, app = _open()
+    app._on_close()
+    os.remove(M.CONFIG_FILE)
+    with open(M.DEVICES_FILE, "w") as fh:
+        json.dump([{"ip": "10.0.0.1", "key": "A", "identity": "R1"}], fh)
+    with open(M.SETTINGS_FILE, "w") as fh:
+        json.dump({"user": "admin", "save": True, "network": "10.20.30.0/24"}, fh)
+    with open(M.UI_FILE, "w") as fh:
+        json.dump({"column_widths": {"Identity": 321}}, fh)
+    with open(M.COMMANDS_FILE, "w") as fh:
+        json.dump({"commands": [":put 1"], "active_command": 0}, fh)
+    app2 = M.ScannerApp(tk.Tk())
+    try:
+        assert app2.devices["A"].identity == "R1" and app2.var_user.get() == "admin"
+        assert int(app2.tree.column("Identity", "width")) == 321
+        assert app2.command_editors[0].get("1.0", "end-1c") == ":put 1"
+        assert app2._networks() == ["10.20.30.0/24"]
+        for old in (M.DEVICES_FILE, M.SETTINGS_FILE, M.UI_FILE, M.COMMANDS_FILE):
+            assert not os.path.exists(old), old
+        assert sorted(f for f in os.listdir(M.APP_DIR) if f.endswith(".json")) == ["mt_config.json"]
+    finally:
+        app2._on_close()
+
+
+def test_gui_duplicate_router_ids_turn_red_and_extra_columns_sort():
+    M, tk, root, app = _open()
+    from core import Device
+    try:
+        app._upsert_device(Device(ip="10.0.0.1", key="A", router_id="10.255.0.1",
+                                  radio=[{"interface": "wlan1", "mac": "1", "rx": -60, "tx": None}]))
+        app._upsert_device(Device(ip="10.0.0.2", key="B", router_id="10.255.0.1",
+                                  radio=[{"interface": "wlan1", "mac": "2", "rx": -80, "tx": None}]))
+        app._upsert_device(Device(ip="10.0.0.3", key="C", router_id="10.255.0.3"))
+        app._tick()
+        assert app.tree.item("A", "tags") == ("dup_rid",) and app.tree.item("B", "tags") == ("dup_rid",)
+        assert not app.tree.item("C", "tags")
+        app.var_errors_only.set(True); app._on_filter_change()
+        assert sorted(app._visible_iids()) == ["A", "B"]
+        app.var_errors_only.set(False); app._on_filter_change()
+        app.devices["B"].router_id = "10.255.0.2"
+        app._rid_dirty = True
+        app._tick()
+        assert not app.tree.item("A", "tags") and not app.tree.item("B", "tags")
+
+        app.sort_by("signal")                               # numerically, the worst first
+        assert app._visible_iids() == ["B", "A", "C"]
+        app.sort_by("router_id")
+        assert app._visible_iids()[0] == "A"
+        app.var_signal_show.set(True); app._on_filter_change()   # «Сигнал» hides devices without radio
+        assert sorted(app._visible_iids()) == ["A", "B"]
+    finally:
+        app._on_close()
+
+
+def test_gui_update_also_looks_for_new_devices_in_scanned_subnets():
+    M, tk, root, app = _open()
+    from core import Device
+    try:
+        app._upsert_device(Device(ip="10.20.76.113", key="K1",
+                                  addresses=[{"address": "45.87.140.1/32", "interface": "vlan2",
+                                              "network": "10.20.76.114"}]))
+        app._remember_networks("10.20.76.112/29")           # .113 - .118
+        extra = app._discovery_targets({"10.20.76.113"})
+        assert extra == ["10.20.76.115", "10.20.76.116", "10.20.76.117", "10.20.76.118"], extra  # .114 is a client
+        app._remember_networks("10.30.0.0/30", replace=True)
+        assert app._networks() == ["10.30.0.0/30"]
+    finally:
+        app._on_close()

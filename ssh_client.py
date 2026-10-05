@@ -353,7 +353,7 @@ def _health_script() -> str:
     parts = [
         ':foreach i in=[/interface ethernet find] do={:put ("__MTSCAN__eth=" . '
         '[/interface ethernet get $i name] . "|" . [/interface ethernet get $i running])}',
-        ':foreach i in=[/interface find where (type="ether" or type="wlan")] do={:do {:put ("__MTSCAN__ld=" . '
+        ':foreach i in=[/interface find where (type="ether" or type="wlan" or type="wifi" or type="wifiwave2" or type="w60g")] do={:do {:put ("__MTSCAN__ld=" . '
         '[/interface get $i name] . "|" . [/interface get $i link-downs])} on-error={}}',
         ':foreach i in=[/interface ethernet find where running] do={:do {'
         ':local m [/interface ethernet monitor $i once as-value]; :put ("__MTSCAN__mon=" . '
@@ -372,6 +372,20 @@ def _health_script() -> str:
         ':foreach i in=[/interface wireless find] do={:put ("__MTSCAN__wlan=" . [/interface wireless get $i name] . "|" . '
         '[/interface wireless get $i disabled] . "|" . [/interface wireless get $i running] . "|" . '
         '[/interface wireless get $i radio-name] . "|" . [/interface wireless get $i ssid])}',
+        ':foreach i in=[/interface wifi find] do={:local s ""; :do {:set s [/interface wifi get $i configuration.ssid]} on-error={}; '
+        ':put ("__MTSCAN__wlan=" . [/interface wifi get $i name] . "|" . [/interface wifi get $i disabled] . "|" . '
+        '[/interface wifi get $i running] . "||" . $s)}',
+        ':foreach i in=[/interface wifi registration-table find] do={:put ("__MTSCAN__reg=" . '
+        '[/interface wifi registration-table get $i interface] . "|" . [/interface wifi registration-table get $i mac-address] . "|" . '
+        '[/interface wifi registration-table get $i signal] . "|")}',
+        ':foreach i in=[/interface wifiwave2 registration-table find] do={:put ("__MTSCAN__reg=" . '
+        '[/interface wifiwave2 registration-table get $i interface] . "|" . [/interface wifiwave2 registration-table get $i mac-address] . "|" . '
+        '[/interface wifiwave2 registration-table get $i signal] . "|")}',
+        ':foreach i in=[/interface w60g find] do={:local n [/interface w60g get $i name]; :local s ""; '
+        ':do {:set s [/interface w60g get $i ssid]} on-error={}; '
+        ':put ("__MTSCAN__wlan=" . $n . "|" . [/interface w60g get $i disabled] . "|" . [/interface w60g get $i running] . "||" . $s); '
+        ':do {:local m [/interface w60g monitor $i once as-value]; :put ("__MTSCAN__w60=" . $n . "|" . '
+        '($m->"remote-address") . "|" . ($m->"rssi") . "|" . ($m->"signal") . "|" . ($m->"connected"))} on-error={}}',
         ':foreach i in=[/interface wireless registration-table find] do={:local tx ""; '
         ':do {:set tx [/interface wireless registration-table get $i tx-signal-strength]} on-error={}; '
         ':put ("__MTSCAN__reg=" . [/interface wireless registration-table get $i interface] . "|" . '
@@ -421,6 +435,11 @@ def parse_health(lines: List[str], dev) -> None:
         elif key == "addr2" and len(fields) >= 5:
             addresses.append({"address": fields[0], "interface": fields[1], "network": fields[2],
                               "dynamic": fields[3] == "true", "disabled": fields[4] == "true"})
+        elif key == "w60" and len(fields) >= 5:
+            entry = health.w60g_entry(fields[0], {"remote-address": fields[1], "rssi": fields[2],
+                                                  "signal": fields[3], "connected": fields[4]})
+            if entry:
+                dev.radio.append(entry)
         elif key == "ospf" and len(fields) >= 2:
             instances.append({"router-id": fields[0], "disabled": fields[1]})
         elif key == "rtid" and len(fields) >= 2:

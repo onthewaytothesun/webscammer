@@ -99,6 +99,7 @@ class _FakeApi:
 
     def talk(self, words):
         key = " ".join(words)
+        self.asked = getattr(self, "asked", []) + [key]
         if key not in self.replies:
             raise RouterOSError("no such command")
         return self.replies[key]
@@ -109,8 +110,9 @@ def test_api_reads_ports_wireless_and_registration_table():
         "/interface/ethernet/print =stats=": [
             {"name": "ether1", "running": "true", "rx-fcs-error": "9", "rx-broadcast": "50"},
             {"name": "ether2", "running": "false"}],
-        "/interface/print =.proplist=name,link-downs,rx-error,tx-error": [
-            {"name": "ether1", "link-downs": "2", "rx-error": "3"}, {"name": "wlan1", "link-downs": "7"}],
+        "/interface/print =.proplist=name,type,link-downs,rx-error,tx-error": [
+            {"name": "ether1", "type": "ether", "link-downs": "2", "rx-error": "3"},
+            {"name": "wlan1", "type": "wlan", "link-downs": "7"}],
         "/interface/ethernet/monitor =numbers=ether1 =once=": [{"rate": "100Mbps", "full-duplex": "false"}],
         "/interface/wireless/print": [{"name": "wlan1", "ssid": "net", "radio-name": "r1",
                                        "disabled": "false", "running": "true"}],
@@ -123,6 +125,8 @@ def test_api_reads_ports_wireless_and_registration_table():
     assert dev.extended
     assert dev.ports[0] == {"name": "ether1", "running": True, "rate": "100Mbps", "full_duplex": "false",
                             "link_downs": 2, "errors": {"rx-fcs-error": 9, "rx-error": 3}}, dev.ports[0]
+    asked = {a for a in api.asked if not a.startswith("/routing/")}
+    assert asked == set(api.replies), asked     # only menus the device has: no wifi / w60g requests
     assert dev.ports[1]["running"] is False and dev.ports[1]["rate"] == ""
     assert dev.wireless[0]["ssid"] == "net" and dev.wireless[0]["link_downs"] == 7 and dev.radio == [{"interface": "wlan1", "mac": "AA", "rx": -78, "tx": -70}]
 
@@ -136,7 +140,7 @@ def test_api_without_wireless_package_is_fine():
 
 def test_ssh_health_script_is_isolated_and_its_reply_parsed():
     script = ssh_client._health_script()
-    assert script.count("[[:parse ") == 10 and script.endswith(':put "__MTSCAN__health=1"')
+    assert script.count("[[:parse ") == 14 and script.endswith(':put "__MTSCAN__health=1"')
     assert ssh_client._rsc_string('a "b" $x \\ y') == '"a \\"b\\" \\$x \\\\ y"'
     reply = """__MTSCAN__eth=ether1|true
 __MTSCAN__eth=ether2|false
@@ -291,3 +295,37 @@ def test_router_id_from_ospf_routeros_6_and_7():
     parsed = Device()
     ssh_client.parse_health(reply, parsed)
     assert parsed.router_id == "10.20.255.7"
+
+
+def test_ax_wifi_and_60ghz_signals_come_from_their_own_menus():
+    api = _FakeApi({
+        "/interface/ethernet/print =stats=": [{"name": "ether1", "running": "false"}],
+        "/interface/print =.proplist=name,type,link-downs,rx-error,tx-error": [
+            {"name": "ether1", "type": "ether"}, {"name": "wifi1", "type": "wifi", "link-downs": "3"},
+            {"name": "wlan60-1", "type": "w60g", "link-downs": "1"}],
+        "/interface/wifi/print": [{"name": "wifi1", "configuration.ssid": "ax-net", "disabled": "false",
+                                   "running": "true"}],
+        "/interface/wifi/registration-table/print": [{"interface": "wifi1", "mac-address": "AA", "signal": "-71"}],
+        "/interface/w60g/print": [{"name": "wlan60-1", "ssid": "link60", "disabled": "false", "running": "true"}],
+        "/interface/w60g/monitor =numbers=wlan60-1 =once=": [
+            {"connected": "true", "remote-address": "BB", "rssi": "-58", "signal": "80"}],
+    })
+    dev = Device(ip="10.0.0.1")
+    core._collect_health(api, dev)
+    assert [w["ssid"] for w in dev.wireless] == ["ax-net", "link60"]
+    assert dev.radio == [{"interface": "wifi1", "mac": "AA", "rx": -71, "tx": None},
+                         {"interface": "wlan60-1", "mac": "BB", "rx": -58, "tx": None, "quality": 80}]
+    assert "/interface/wireless/print" not in api.asked and "/interface/wifiwave2/print" not in api.asked
+    assert health.signal_text(dev.radio) == "wifi1 rx -71; wlan60-1 rx -58 / signal 80"
+    assert health.w60g_entry("wlan60-1", {"connected": "false", "rssi": "-60"}) is None
+    assert core.radio_kinds({}) == {"wlan", "wifi", "wifiwave2", "w60g"}      # list unknown: ask everything
+    reply = ["__MTSCAN__wlan=wifi1|false|true||ax-net", "__MTSCAN__reg=wifi1|AA|-71|",
+             "__MTSCAN__w60=wlan60-1|BB|-58|80|true", "__MTSCAN__health=1"]
+    parsed = Device()
+    ssh_client.parse_health(reply, parsed)
+    assert parsed.radio == dev.radio and parsed.wireless[0]["ssid"] == "ax-net"
+
+
+def test_port_errors_count_from_10():
+    assert health.port_issues([_port(errors={"rx-fcs-error": 9})]) == []
+    assert health.port_issues([_port(errors={"rx-fcs-error": 10})]) == ["ether1 ошибки rx-fcs-error=10"]

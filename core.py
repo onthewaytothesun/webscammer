@@ -468,8 +468,10 @@ def _collect_health(api: RouterOSApi, dev: Device) -> None:
                            "full_duplex": "", "link_downs": None,
                            "errors": health.error_counters(row)}
     link_downs: Dict[str, Optional[int]] = {}
-    for row in _talk_or_empty(api, ["/interface/print", "=.proplist=name,link-downs,rx-error,tx-error"]):
+    types: Dict[str, str] = {}
+    for row in _talk_or_empty(api, ["/interface/print", "=.proplist=name,type,link-downs,rx-error,tx-error"]):
         link_downs[row.get("name", "")] = health.to_int(row.get("link-downs"))
+        types[row.get("name", "")] = row.get("type", "")
         port = ports.get(row.get("name", ""))
         if port is not None:
             port["link_downs"] = health.to_int(row.get("link-downs"))
@@ -482,22 +484,63 @@ def _collect_health(api: RouterOSApi, dev: Device) -> None:
                 port["rate"] = mon[0].get("rate", "")
                 port["full_duplex"] = mon[0].get("full-duplex", "")
     dev.ports = list(ports.values())
-    dev.wireless = [
-        {"name": r.get("name", ""), "ssid": r.get("ssid", ""), "radio_name": r.get("radio-name", ""),
-         "disabled": r.get("disabled") == "true", "running": r.get("running") == "true",
-         "link_downs": link_downs.get(r.get("name", ""))}
-        for r in _talk_or_empty(api, ["/interface/wireless/print"])
-    ]
-    dev.radio = [
-        {"interface": r.get("interface", ""), "mac": r.get("mac-address", ""),
-         "rx": health.parse_signal(r.get("signal-strength", "")),
-         "tx": health.parse_signal(r.get("tx-signal-strength", ""))}
-        for r in _talk_or_empty(api, ["/interface/wireless/registration-table/print"])
-    ]
+    dev.wireless, dev.radio = [], []
+    kinds = radio_kinds(types)
+    if "wlan" in kinds:            # classic wireless package (wlan1, wlan2)
+        _read_wireless(api, dev, "/interface/wireless", link_downs)
+        dev.radio += [
+            {"interface": r.get("interface", ""), "mac": r.get("mac-address", ""),
+             "rx": health.parse_signal(r.get("signal-strength", "")),
+             "tx": health.parse_signal(r.get("tx-signal-strength", ""))}
+            for r in _talk_or_empty(api, ["/interface/wireless/registration-table/print"])
+        ]
+    for menu in ("wifi", "wifiwave2"):  # AX on RouterOS 7 (wifi1, wifi2)
+        if menu in kinds:
+            _read_wireless(api, dev, "/interface/" + menu, link_downs)
+            dev.radio += [
+                {"interface": r.get("interface", ""), "mac": r.get("mac-address", ""),
+                 "rx": health.parse_signal(r.get("signal") or r.get("signal-strength", "")), "tx": None}
+                for r in _talk_or_empty(api, [f"/interface/{menu}/registration-table/print"])
+            ]
+    if "w60g" in kinds:            # 60 GHz (wlan60-1): the signal is in «monitor»
+        _read_wireless(api, dev, "/interface/w60g", link_downs)
+        for wlan in dev.wireless:
+            if wlan.get("menu") == "w60g" and not wlan["disabled"]:
+                mon = _talk_or_empty(api, ["/interface/w60g/monitor", "=numbers=" + wlan["name"], "=once="])
+                entry = health.w60g_entry(wlan["name"], mon[0]) if mon else None
+                if entry:
+                    dev.radio.append(entry)
     dev.router_id = pick_router_id(
         _talk_or_empty(api, ["/routing/ospf/instance/print"]),
         _talk_or_empty(api, ["/routing/id/print"]))
     dev.extended = True
+
+
+def radio_kinds(types: Dict[str, str]) -> set:
+    """Which wireless menus to ask, from /interface print (name -> type). Only the
+    menus the device has are asked; without the list (not readable) all of them."""
+    if not types:
+        return {"wlan", "wifi", "wifiwave2", "w60g"}
+    kinds = set()
+    for name, kind in types.items():
+        if kind == "wlan" and not name.startswith("wlan60"):
+            kinds.add("wlan")
+        elif kind in ("wifi", "wifiwave2", "w60g"):
+            kinds.add(kind)
+        elif name.startswith("wlan60"):
+            kinds.add("w60g")
+        elif name.startswith("wifi"):
+            kinds.update(("wifi", "wifiwave2"))
+    return kinds
+
+
+def _read_wireless(api: RouterOSApi, dev: Device, menu: str, link_downs: Dict[str, Optional[int]]) -> None:
+    for r in _talk_or_empty(api, [menu + "/print"]):
+        dev.wireless.append({
+            "name": r.get("name", ""), "ssid": r.get("ssid") or r.get("configuration.ssid", ""),
+            "radio_name": r.get("radio-name", ""), "disabled": r.get("disabled") == "true",
+            "running": r.get("running") == "true", "link_downs": link_downs.get(r.get("name", "")),
+            "menu": menu.rsplit("/", 1)[-1]})
 
 
 def _is_auth_failure(exc: Exception) -> bool:
@@ -777,7 +820,8 @@ def sanitize(name: str) -> str:
     return cleaned or "unknown"
 
 
-_BACKUP_NAME = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})_.*\.rsc$")
+# .rsc made by the program; .backup / other files can be added by hand (attach_manual_backup)
+_BACKUP_NAME = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})_.*\.(?:rsc|backup)$", re.I)
 
 
 def _newest_backups(backup_dir: str) -> Dict[str, Tuple[float, str]]:

@@ -7,3 +7,5 @@ ui.json
 Backups/
 logs/
 commands.json
+mt_config.json
+*.broken
